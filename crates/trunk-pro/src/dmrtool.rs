@@ -115,6 +115,7 @@ pub fn run(a: &Args) {
     // Per slot: the last LC printed (only changes are), voice frames since.
     let mut last_lc: [Option<dmr::Lc>; 2] = [None, None];
     let mut encrypted = [false; 2];
+    let mut aliases = [dmr::alias::Tracker::default(), dmr::alias::Tracker::default()];
     let t0 = Instant::now();
     cap.channelize(&mut chz, |chz| {
         syms.clear();
@@ -163,6 +164,9 @@ pub fn run(a: &Args) {
                 if let Some(xpt) = control {
                     let _ = writeln!(out, "{}", serde_json::json!({ "t": t, "slot": s, "xpt": xpt }));
                 }
+                if let Some(hytera) = dmr::hytera::diagnostic(&e) {
+                    let _ = writeln!(out, "{}", serde_json::json!({ "t": t, "slot": s, "hytera": hytera }));
+                }
                 match e {
                     SlotEvent::Voice { frame, .. } => {
                         vcw += 1;
@@ -179,6 +183,9 @@ pub fn run(a: &Args) {
                         }
                     }
                     SlotEvent::Lc { lc, from } => {
+                        if let Some(alias) = aliases[s as usize].observe(lc, from, t, chan.xpt) {
+                            let _ = writeln!(out, "{}", serde_json::json!({ "t": t, "slot": s, "alias": alias }));
+                        }
                         if lc.voice_user().is_some() {
                             if from == LcFrom::Header { encrypted[s as usize] = lc.encrypted(); }
                             else if from != LcFrom::Terminator { encrypted[s as usize] |= lc.encrypted(); }
@@ -194,8 +201,8 @@ pub fn run(a: &Args) {
                                 lc.voice_user().unwrap_or_else(|| matches!(dmr::xpt::flco(&lc.0), Some(dmr::xpt::Control::Setup { group: true, .. }))),
                                 decoded.target(),
                                 decoded.source(),
-                                lc.emergency(),
-                                lc.encrypted(),
+                                lc.voice_user().is_some() && lc.emergency(),
+                                lc.voice_user().is_some() && lc.encrypted(),
                                 hex(&lc.0)
                             );
                         }

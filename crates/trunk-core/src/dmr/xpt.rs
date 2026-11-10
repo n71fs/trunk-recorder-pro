@@ -14,6 +14,8 @@ pub enum Control {
     Adjacent { sequence: u8, sites: [Neighbor; 4] },
     Short { free: u8, priority: u8, target_hash: u8 },
     Setup { repeater: u8, slot: u8, group: bool, target: u16, source: u16, free: u8, handshake: u8, reserved: u8 },
+    /// Data/control preamble, not a voice grant. Repeater hints are raw observations.
+    Preamble { data: bool, group: bool, blocks: u8, free: u8, priority: u8, target: u16, priority_hash: u8, source: u16, reserved: u8 },
 }
 
 /// Target is an eight-bit group hint or private-target hash, never a radio ID.
@@ -50,6 +52,19 @@ pub fn csbk(b: &[u8]) -> Option<Control> {
                 free: b[3 + i * 2] >> 4,
                 reserved: (b[2 + i * 2] & 7) << 4 | (b[3 + i * 2] & 15),
             }),
+        }),
+        // Unlike the status banks, these top bits retain their normal LB/PF meaning.
+        // Do not interpret a protected preamble's payload as clear signaling.
+        0x3d if b[0] & 0x40 == 0 => Some(Control::Preamble {
+            data: b[2] & 0x80 != 0,
+            group: b[2] & 0x40 != 0,
+            blocks: b[3],
+            free: b[4] >> 4,
+            priority: b[4] & 15,
+            target: u16::from_be_bytes([b[5], b[6]]),
+            priority_hash: b[7],
+            source: u16::from_be_bytes([b[8], b[9]]),
+            reserved: b[2] & 0x3f,
         }),
         _ => None,
     }
@@ -190,6 +205,10 @@ impl Tracker {
                 self.state.setups.push(Timed { value: message.clone(), heard_s: now });
                 Some(*free)
             }
+            // The supplied capture's data carrier advertises free=15 while the
+            // voice carriers advertise free=5. Report it without replacing the
+            // voice-site free/priority state or inventing a repeater mapping.
+            Control::Preamble { .. } => None,
         };
         if let Some(value) = free {
             self.state.free = (value != 0).then_some(Timed { value, heard_s: now });
@@ -277,6 +296,35 @@ mod tests {
         let lc = voice(25, false);
         assert_eq!(voice_lc(lc, false), lc);
         assert_eq!((voice_lc(lc, true).target(), voice_lc(lc, true).source()), (25, 0x1234));
+    }
+
+    #[test]
+    fn captured_data_preambles_are_not_voice_grants_or_voice_repeater_assignments() {
+        // 453.6375 MHz, supplied 20261110-025018/source-3 capture.
+        let bytes = [0xbd, 0x68, 0x80, 0x12, 0xf0, 0x02, 0x08, 0, 0, 0x10];
+        let preamble = csbk(&bytes).unwrap();
+        assert_eq!(preamble, Control::Preamble {
+            data: true, group: false, blocks: 18, free: 15, priority: 0,
+            target: 520, priority_hash: 0, source: 16, reserved: 0,
+        });
+        let mut changed = bytes;
+        changed[0] = 0x3d; // LB is not an XPT sequence number here.
+        assert_eq!(csbk(&changed), Some(preamble.clone()));
+        changed[0] |= 0x40;
+        assert!(csbk(&changed).is_none(), "protected payload is not clear XPT evidence");
+        changed = bytes;
+        changed[1] = 0;
+        assert!(csbk(&changed).is_none(), "standard DMR preamble has a different address layout");
+        // Exercise fields that are zero in this capture, using the documented layout.
+        assert_eq!(csbk(&[0x3d, 0x68, 0x45, 7, 0x23, 0x12, 0x34, 0xab, 0x56, 0x78]), Some(Control::Preamble {
+            data: false, group: true, blocks: 7, free: 2, priority: 3,
+            target: 0x1234, priority_hash: 0xab, source: 0x5678, reserved: 5,
+        }));
+        let mut tracker = Tracker::default();
+        tracker.control(Control::Short { free: 5, priority: 2, target_hash: 149 }, 1.0);
+        let before = tracker.state.clone();
+        tracker.control(preamble, 1.1);
+        assert_eq!(tracker.state, before, "data hints cannot replace voice status or create calls/setups");
     }
 
     #[test]

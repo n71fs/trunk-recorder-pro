@@ -355,6 +355,16 @@ impl Site {
             site_code(self.color_code, cc, idx < self.n_control, self.n_control > 0)
         };
         if !accepted { return; }
+        if let Some(diagnostic) = super::hytera::diagnostic(&e) {
+            let raw = match &e {
+                SlotEvent::Csbk { csbk, .. } => csbk.0.as_slice(),
+                SlotEvent::Lc { lc, .. } => lc.0.as_slice(),
+                SlotEvent::Slco(raw) => raw.as_slice(),
+                _ => unreachable!(),
+            };
+            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            self.control_status(idx, slot, format!("Hytera {diagnostic:?} raw={hex}"), t, out);
+        }
         match e {
             SlotEvent::Lc { lc, from } => {
                 if let Some(control) = super::xpt::flco(&lc.0) {
@@ -427,6 +437,10 @@ impl Site {
         self.xpt.control(control.clone(), t);
         let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
         let meta = format!("XPT {control:?} raw={hex}");
+        self.control_status(idx, slot, meta, t, out);
+    }
+
+    fn control_status(&mut self, idx: usize, slot: u8, meta: String, t: f64, out: &mut Vec<Message>) {
         self.recent_status.retain(|(_, at)| t - at < STATUS_REPEAT_S);
         if !self.recent_status.iter().any(|(text, _)| *text == meta) {
             self.recent_status.push((meta.clone(), t));
@@ -837,6 +851,42 @@ mod tests {
         s.event(1, 0, SlotEvent::Lc { lc: Lc([0, 0x68, 0, 0, 0, 25, 0, 0, 5]), from: LcFrom::Header }, 0.1, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].voice.color_code(), Some(2));
+    }
+
+    #[test]
+    fn data_carrier_identifies_xpt_only_from_preamble_and_never_grants_voice() {
+        use crate::dmr::slot::Lc;
+        let mut s = Site::new(&[453_637_500.0], 24_000.0, DmrConfig::default());
+        s.carriers[0].chan.slots[0].color_code = Some(13);
+        let mut out = Vec::new();
+        let observed = [
+            SlotEvent::Csbk { csbk: Csbk([0x8d, 0x68, 0x7f, 0xff, 0, 0, 0, 0, 0, 0]), mbc: false },
+            SlotEvent::Slco([0xc6, 0x87, 0xff, 0xfe, 0xe0]),
+            SlotEvent::Lc { lc: Lc([0x0d, 0x68, 0, 0x7f, 0xff, 0x80, 0, 2, 8]), from: LcFrom::Terminator },
+            SlotEvent::Lc { lc: Lc([0x30, 0x68, 0xf0, 0x7f, 0xff, 0, 0, 0x10, 0x60]), from: LcFrom::Terminator },
+        ];
+        for e in observed { s.event(0, 0, e, 0.0, &mut out); }
+        assert_eq!(out.len(), 4);
+        assert_eq!(s.variant, None, "proprietary payloads do not establish XPT");
+        s.event(0, 0, SlotEvent::Csbk { csbk: Csbk([0xbd, 0x68, 0x80, 0x12, 0xf0, 2, 8, 0, 0, 16]), mbc: false }, 0.1, &mut out);
+        assert_eq!(s.variant, Some(Variant::Xpt));
+        assert!(s.carriers[0].chan.xpt, "late-entry voice receiver gets XPT context");
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|m| m.kind == MessageType::Status && m.talkgroup == 0 && !m.encrypted && !m.emergency));
+        assert!(out.iter().all(|m| m.freq_hz == 453_637_500 && m.voice.slot() == Some(0)));
+        assert!(s.xpt.state.calls.is_empty() && s.xpt.state.setups.is_empty());
+        assert!(s.xpt.state.free.is_none() && s.xpt.state.priority.is_none());
+        assert!(s.table.saved().is_empty(), "no channel mapping learned from data addresses");
+        let n = out.len();
+        s.event(0, 0, SlotEvent::Slco([0xc6, 0x87, 0xff, 0xfe, 0xe0]), 0.2, &mut out);
+        assert_eq!(out.len(), n, "repeated diagnostic is deduplicated");
+        // Receiving unrelated data control cannot end or relabel actual voice.
+        let lc = Lc([0, 0x68, 0, 0x50, 0, 149, 0, 0x13, 0x8e]);
+        s.event(0, 0, SlotEvent::Lc { lc, from: LcFrom::Header }, 0.3, &mut out);
+        assert_eq!((out.last().unwrap().talkgroup, out.last().unwrap().source), (149, 5006));
+        s.event(0, 0, SlotEvent::Lc { lc: Lc([0x30, 0x68, 0xf0, 0x7f, 0xff, 0, 0, 0x10, 0x60]), from: LcFrom::Terminator }, 0.4, &mut out);
+        assert_eq!(s.xpt.state.calls[0].target, 149);
+        assert!(!s.xpt.state.calls[0].encrypted);
     }
 
 }

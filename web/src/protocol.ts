@@ -786,7 +786,8 @@ export type XptControl =
   | { Status: { sequence: number; free: number; slots: XptOccupancy[] } }
   | { Adjacent: { sequence: number; sites: XptNeighbor[] } }
   | { Short: { free: number; priority: number; target_hash: number } }
-  | { Setup: { repeater: number; slot: number; group: boolean; target: number; source: number; free: number; handshake: number; reserved: number } };
+  | { Setup: { repeater: number; slot: number; group: boolean; target: number; source: number; free: number; handshake: number; reserved: number } }
+  | { Preamble: { data: boolean; group: boolean; blocks: number; free: number; priority: number; target: number; priority_hash: number; source: number; reserved: number } };
 export interface XptOccupancy { status: number; target_hint: number }
 export interface XptNeighbor { site: number; free: number; reserved: number }
 export interface XptTimed<T> { value: T; heard_s: number }

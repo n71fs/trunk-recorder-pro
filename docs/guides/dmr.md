@@ -122,6 +122,34 @@ out of the audio. A call that was all encrypted is kept, without audio, only whe
 `recordEncrypted` is `true` in the config file; there is no switch for it in Setup. The recorder
 can't decrypt anything.
 
+## Over-the-air radio names
+
+DMR talker aliases are decoded from embedded link control on trunked and
+conventional channels. Supported forms are standard FID `0x00` and Hytera FID
+`0x68` (FLCO `0x04`–`0x07`), and Motorola FID `0x10` (FLCO `0x14`–`0x17`).
+The four encodings are 7-bit ASCII, ISO-8859-1, UTF-8 and UTF-16BE. Lengths
+are code units, not displayed characters; multibyte characters and UTF-16
+surrogate pairs may cross fragments.
+
+Complete, valid aliases with fresh voice LC identifying the radio use the
+existing learned-radio-name store and name-priority settings. Assembly is
+independent for each carrier and slot. Missing/out-of-order/conflicting blocks,
+new headers, source/talkgroup changes, matching voice termination, protected LC
+and four-second timeouts discard incomplete state. An alias cannot establish
+a call's identity or change its encryption state.
+
+`tool dmr` emits `alias` JSON records with text, format, declared/received code
+units, `complete`, and the radio/talkgroup when known. Valid partial Unicode
+prefixes are shown without replacement characters; partial or unattributed
+results never overwrite saved radio names. For example, the supplied Hytera
+capture declares 13 UTF-16 units but only supplies six (`Hytera`) before its
+alias header repeats. This remains a partial diagnostic, not a learned name.
+
+No alias is invented when the feature is disabled or fragments are absent.
+Clear alias LC can be decoded even when audio is encrypted; protected/encrypted
+LC itself is not decrypted. Protocol layouts follow ETSI TS 102 361-2 V2.5.1
+§§7.1.1.4–5 and 7.2.18–19, cross-checked against DSD-FME and SDRTrunk.
+
 ## Several sites
 
 A DMR site doesn't announce which system it belongs to, so the recorder can't tell on its own that

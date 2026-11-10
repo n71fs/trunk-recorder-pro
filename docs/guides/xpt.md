@@ -65,6 +65,7 @@ and CRC8, and emits short LC. An incomplete sequence is discarded.
 | FID `0x68`, CSBK `0x0B` | Four neighbor site numbers, free repeaters, reserved fields; informational only |
 | SLCO `0x08` | Free repeater, priority repeater and target hash; no FID in short LC |
 | FID `0x68`, FLCO `0x09` | Setup/alert repeater, encoded slot, group/private, 16-bit target/source, free repeater, handshake and reserved fields |
+| FID `0x68`, CSBK `0x3D` | Data/control preamble: group/private, blocks to follow, 16-bit target/source, free/priority repeater hints, priority hash and reserved bits; identifies XPT but never grants voice |
 | Voice FLCO `0x00` / `0x03` | Confirmed group/private call on received carrier and slot, target/source, privacy and emergency options |
 | Voice terminator | Ends the matching tracker call; normal recorder hang-time rules apply |
 | Privacy indicator | Marks encrypted traffic; the existing decoder suppresses encrypted audio |
@@ -96,6 +97,21 @@ pending setups and confirmed calls). `availableRepeaters` lists repeaters with
 at least one fresh, explicitly idle slot; unknown/private/inactive states do not
 imply availability. Each observation carries its receive time.
 
+Data/control preambles are reported as observations. They do not replace the
+voice-site free/priority state: in the supplied capture the data carrier's
+preambles advertise free repeater 15 while the voice carriers advertise 5.
+The meaning of that difference is unverified. Preamble addresses and hashes
+never create voice calls, establish home groups or learn frequency mappings.
+Protected preambles are not interpreted as clear XPT identification.
+
+The same message stream reports Hytera CSBK `0x0D`, full LC `0x0D`, short LC
+`0x0C` with the observed embedded `0x68` manufacturer value, and data terminator
+LC `0x30`. The proprietary forms retain their opcode/flags and raw payload;
+their field meanings remain unverified. In particular the repeated `0x7FFF`
+value is not treated as a site, radio or talkgroup ID. These diagnostics alone
+do not identify XPT or alter voice, privacy, availability or site membership.
+Data terminators are informational and cannot end a voice call.
+
 For undeduplicated control diagnostics, use the existing tool:
 
 ```sh
@@ -104,27 +120,58 @@ trunk-pro tool dmr site.cu8 --center 451000000 --rate 2400000 --freq 451012500 -
 
 It emits JSON lines for raw CSBK, full LC and short LC, plus decoded XPT fields.
 Voice IDs use the XPT interpretation after detection; raw hex stays unchanged.
+Additional `hytera` records expose the data terminator and proprietary forms.
+`alias` records show complete or partial over-the-air radio names; see
+[DMR radio-name decoding](dmr.md#over-the-air-radio-names).
+The CLI's `encrypted`/`emergency` fields apply to recognized voice-user LCs;
+nonvoice payload bits are not interpreted as voice service options.
 Privacy indicators and service-option encryption flags are reported. Encrypted
 frames are not vocoded by either the recorder or the tool. No key is requested.
 
 ## Evidence and milestones
 
-No actual XPT IQ/audio captures were supplied with this change. The two supplied
-PDFs are system descriptions, not over-the-air test vectors. **No XPT behavior
-is claimed as capture-validated yet.**
+The initial implementation used synthetic tests and two system-description PDFs.
+Subsequent supplied captures now validate part of the receive path:
+
+- A 4.704-second voice tape at 453.5375 MHz decodes TG 149 / RID 5006 on slot 2,
+  with 108 good frames and no errors. The pre-XPT build reports TG 4,194,453.
+- `20261110-025018/source-3` is 30 seconds of 1.024 MS/s `cu8` IQ centered at
+  453.506 MHz (SHA-256 `698af12cfc3685e0b8c9b41187d55130931429149b6bbc2f663c49cbc2e3ef26`).
+  Replaying an isolated copy with only source 3 and the configured WCS DMR site
+  records TG 149 / RID 5006 on 453.5375 MHz slot 1: 276 and 108 good frames,
+  5.52 and 2.16 seconds of audio, no errors. The pre-XPT build reports TG
+  5,243,029; both builds produce identical audio. This does not reproduce the
+  original no-audio symptom.
+- The same IQ contains XPT status/short LC on 453.425 MHz and XPT data preambles
+  on 453.6375 MHz. On the latter, 32 valid preambles count down from 18 to 3
+  for targets 520 and 620, from source 16, followed by data bursts and
+  terminators; there are no voice frames. Proprietary CSBK/LC `0x0D` and short
+  LC `0x0C` are retained for further research. Positive XPT identification does
+  not prove that independently configured carriers belong to the same site.
+- Embedded Hytera alias LC on the voice carrier contains the UTF-16BE prefix
+  `Hytera`. Its header declares 13 code units, but only six arrive in the
+  header/block-1 sequence; it is exposed as partial and does not replace the
+  saved name for radio 5006. Alias format bits are not voice privacy flags.
+
+The supplied ZIPs contain individual radios while the original collection and
+configuration reference five. Keep originals intact; use an explicitly isolated
+copy/configuration to replay one radio. Captures are not redistributed in git;
+the tests include the observed control payloads.
 
 | Evidence | What it supports |
 | --- | --- |
 | Hytera XPT System Application Notes R5.0, §§1.2 and 4.1 | Home/free repeater model, one free repeater at a time, at most eight voice repeaters, 16-bit radio allocation, group ranges, independently configurable repeater color codes |
 | Hytera DMR Systems White Paper, “How XPT Works” and “Multi-Site XPT” | Dynamic sharing of two-slot repeaters and separate sites connected over IP |
 | DSD-FME `audio_work` revision `34753963b8855c6c07b79250cb4de4f2c38a4613`, `src/dmr_csbk.c`, `src/dmr_flco.c` | Proprietary bit positions, sequence banks, 16-bit LC addressing, setup in terminator LC, uncertain status meanings and lack of reliable current-site identification |
+| Hytera priority-signaling patent US20180176984A1, table 6; SDRTrunk revision `02c62d012fe88ea581f05c6082af12ca7adf65dc`, `HyteraXPTPreamble` and `Preamble` | CSBK `0x3D` preamble layout and 16-bit addressing |
+| DSD-FME `src/dmr_flco.c`, TD_LC handling (ETSI TS 102 361-3 §7.1.1.1) | FLCO `0x30` in a terminator burst is data control, not voice |
 | Synthetic payload, FEC and IQ tests | Parser bounds, field extraction, bank/free changes, setup, mapping, late entry, concurrent tracking, termination, stale state, site isolation, privacy and correct recorded IDs across concurrent repeaters |
 
 Milestone 1 is implemented and synthetic-tested: positive signaling identifies
 XPT and decodes the supported CSBK/SLCO/FLCO control messages. Milestone 2 has a
-working synthetic-tested recording path through the existing engine, including
-two concurrent repeaters with different codes and slots. Reliable operation on
-real systems still requires capture replay and live validation.
+working recording path through the existing engine, including synthetic tests
+of two concurrent repeaters with different codes and slots, and the limited
+real-capture checks above. Broader operation still requires live validation.
 
 Remaining unverified behavior includes reserved slot states (especially state 1),
 private target-hash correlations, nonzero priority fields, setup handshake/release
@@ -149,8 +196,13 @@ Protocol field research credits DSD-FME / LWVMOBILE (2022–2023), DSD Author,
 and the upstream projects acknowledged by DSD-FME. Its copyright/permission
 notice is retained in [DSD-FME.txt](../licenses/DSD-FME.txt). This repository's
 GPL-3.0-or-later license remains in force. No Hytera PDFs are redistributed.
+The additional preamble field research credits Dennis Sheirer / SDRTrunk
+(GPL-3.0-or-later); its decoder is not linked or vendored.
 
 - [Application notes](https://www.hamdigitaal.nl/download/algemene-informatie/XPT-System_Application-Notes_R5.0.pdf)
 - [White paper](https://www.hytera.us/wp-content/uploads/2023/10/Hytera_DMR_Systems_White_Paper_vA.pdf)
 - [Pinned DSD-FME](https://github.com/lwvmobile/dsd-fme/tree/34753963b8855c6c07b79250cb4de4f2c38a4613)
+- [Hytera priority-signaling patent, table 6](https://patents.google.com/patent/US20180176984A1/en)
+- [Pinned SDRTrunk preamble definition](https://github.com/DSheirer/sdrtrunk/blob/02c62d012fe88ea581f05c6082af12ca7adf65dc/src/main/java/io/github/dsheirer/module/decode/dmr/message/data/csbk/hytera/HyteraXPTPreamble.java)
+- [ETSI TS 102 361-2 V2.5.1 (talker aliases)](https://www.etsi.org/deliver/etsi_ts/102300_102399/10236102/02.05.01_60/ts_10236102v020501p.pdf)
 - [ETSI TS 102 361-1 V2.7.1](https://www.etsi.org/deliver/etsi_ts/102300_102399/10236101/02.07.01_60/ts_10236101v020701p.pdf)

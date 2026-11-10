@@ -10544,6 +10544,59 @@
             "Setup"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Preamble": {
+              "type": "object",
+              "properties": {
+                "data": {
+                  "type": "boolean"
+                },
+                "group": {
+                  "type": "boolean"
+                },
+                "blocks": {
+                  "type": "number"
+                },
+                "free": {
+                  "type": "number"
+                },
+                "priority": {
+                  "type": "number"
+                },
+                "target": {
+                  "type": "number"
+                },
+                "priority_hash": {
+                  "type": "number"
+                },
+                "source": {
+                  "type": "number"
+                },
+                "reserved": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "data",
+                "group",
+                "blocks",
+                "free",
+                "priority",
+                "target",
+                "priority_hash",
+                "source",
+                "reserved"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "Preamble"
+          ],
+          "additionalProperties": false
         }
       ],
       "description": "XPT observations are site-local; target hints/hashes are not full radio IDs."
