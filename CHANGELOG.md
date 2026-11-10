@@ -5,6 +5,28 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+## [0.3.5-xpt.2] — 2026-11-10
+
+- **Decode over-the-air DMR radio names.** Standard, Hytera and Motorola talker aliases support 7-bit ASCII, ISO-8859-1,
+  UTF-8 and UTF-16BE. Complete names with fresh talker identification use the existing learned-radio-name store and
+  name-priority settings on trunked and conventional channels. Assembly stays separate by carrier and slot and discards
+  stale, missing, conflicting or protected fragments. Clear alias metadata can be read when audio is encrypted;
+  protected link control is not decrypted.
+- **Show incomplete aliases without saving truncated names.** `tool dmr` reports decoded text, encoding, declared and
+  received code units, completeness, and the radio/talkgroup when known. The supplied capture's clear `Hytera` prefix
+  contains six of 13 declared UTF-16 units, so it remains a partial diagnostic for radio 5006.
+- **Recognize XPT data/control preambles** (Hytera CSBK `0x3D`) and report block counts, 16-bit addresses and raw
+  free/priority repeater hints. A preamble never opens a voice call or replaces voice-site repeater state. The supplied
+  data carrier identifies as XPT without producing false voice recordings.
+- Report Hytera data terminators and the captured proprietary CSBK/LC `0x0D` and short LC `0x0C` in the decoded-message
+  stream and CLI diagnostics. Unknown payload fields remain uninterpreted, and nonvoice LC bits are no longer displayed
+  as voice emergency/encryption flags. These messages do not establish shared-site membership or frequency mappings.
+- **Real-capture validation:** the supplied XPT recordings retain the corrected TG 149 / RID 5006 and byte-identical
+  audio. All 13 corpus captures match the pre-XPT comparison, and 41 DMR tests pass. Complete synthetic aliases are
+  learned in both trunked and conventional modes. The original no-audio symptom is not reproduced.
+- This remains an experimental fork prerelease. Proprietary field meanings, data/voice repeater-hint differences,
+  firmware variations and broader live-system behavior still need validation. See the DMR and XPT guides.
+
 ## [0.3.5-xpt.1]
 
 - Add receive-only Hytera XPT support to the existing DMR trunked receiver: XPT CSBK, SLCO and FLCO parsing, site-local repeater and call tracking, and concurrent clear-voice recording across configured carriers and slots.
