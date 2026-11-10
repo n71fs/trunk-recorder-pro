@@ -5,6 +5,14 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+## [0.3.5-xpt.1]
+
+- Add receive-only Hytera XPT support to the existing DMR trunked receiver: XPT CSBK, SLCO and FLCO parsing, site-local repeater and call tracking, and concurrent clear-voice recording across configured carriers and slots.
+- Correct inflated XPT talkgroup and radio IDs by reading the 16-bit XPT fields after positive identification; retain ordinary DMR's 24-bit addressing.
+- Add logical repeater mappings, per-frequency color-code filters, programmed home-group maps, encrypted-call identification and raw signaling diagnostics.
+- Preserve XPT settings and decoder context in configuration editing, capture export and replay tapes.
+- This is an experimental fork prerelease. Parser, tracking, ID extraction and concurrent recording are synthetic-tested; actual XPT captures and firmware variations remain unvalidated. See [the XPT guide](docs/guides/xpt.md) for configuration, research sources and limitations.
+
 ## [0.3.5] — 2026-11-09
 
 - **A call heard on several sites is now one call to plugins and stats, from its first copy's start to its last copy's end.** Before, it was
