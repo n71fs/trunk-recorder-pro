@@ -55,11 +55,11 @@ use std::sync::Arc;
 use num_complex::Complex32;
 
 use super::calls::{Call, CallConfig, CallEvent, CallIds, CallManager, CallSource, CarriesOn, Flags, Policy, Voice};
-use super::engine::{Event, Pins, SystemConfig, Tuning};
+use super::engine::{Event, LiveAudio, Pins, SystemConfig, Tuning};
 use super::inband::InBandSpec;
 use super::record::RecordedOn;
 use super::recorded::Recorded;
-use super::tape::{TapeSink, VoiceTape};
+use super::tape::{Tapes, VoiceTape};
 use super::voice::CipherId;
 use super::talkgroups::{Talkgroup, Talkgroups};
 use super::voice::TrackerOut;
@@ -546,10 +546,8 @@ struct Open {
 }
 
 /// A channel that closed: its tape to the host.
-fn keep_tape(sink: &TapeSink, o: &mut Open) {
-    if let (Some(sink), Some(t)) = (sink, o.tape.take()) {
-        sink.lock().unwrap().push(t);
-    }
+fn keep_tape(sink: &Tapes, o: &mut Open) {
+    sink.keep(o.tape.take());
 }
 
 /// A conventional frequency as the dashboard shows it ([`Conventional::channels`]).
@@ -626,7 +624,7 @@ struct Floor {
 
 pub struct Conventional {
     /// Where closed channels' tapes go ([`super::engine::EngineConfig::tapes`]).
-    pub(super) tape_sink: TapeSink,
+    pub(super) tape_sink: Tapes,
     cfg: ConvConfig,
     bank_cfg: BankConfig,
     /// Keep each call's vocoder frames (see [`super::frames`]).
@@ -729,7 +727,7 @@ impl Conventional {
                 Floor { slices: vec![0.0; n], scratch: vec![0.0; n], next_s: 0.0, primed: false }
             })
             .collect();
-        Ok(Conventional { cfg, bank_cfg, capture_frames, chans, floors, tape_sink: None })
+        Ok(Conventional { cfg, bank_cfg, capture_frames, chans, floors, tape_sink: Tapes::default() })
     }
 
     /// Whether `channels` can run together: rows on one frequency have one
@@ -892,7 +890,7 @@ impl Conventional {
                     ch.bar_db = base;
                 }
                 if snr_db >= ch.bar_db {
-                    Self::open(ch, chz, now_s, self.cfg.preroll_s, self.tape_sink.is_some(), self.bank_cfg, self.cfg.vocoder, meter_thr, idx as u32, ids, rules, out);
+                    Self::open(ch, chz, now_s, self.cfg.preroll_s, self.tape_sink.on(), self.bank_cfg, self.cfg.vocoder, meter_thr, idx as u32, ids, rules, out);
                 }
                 continue;
             }
@@ -1189,7 +1187,7 @@ impl Conventional {
             let new_tg = ota.is_some() && air_tg.is_some_and(|t| Some(t) != ota);
             let new_row = l.row != r && (ch.mode.analog() || air_tg.is_some());
             let carry_on: Option<(Vec<CallSource>, CarriesOn)> = if rules.calls.too_long(&l.call, now_s) {
-                let talking = l.call.sources.last().map(|s| CallSource { time_s: now_s, ..s.clone() });
+                let talking = l.call.talker().map(|s| CallSource { time_s: now_s, ..s.clone() });
                 Some((talking.into_iter().collect(), CarriesOn::TooLong))
             } else {
                 rules.calls.new_transmission(&l.call, from_s).map(|i| (l.call.sources.split_off(i), CarriesOn::NewTransmission))
@@ -1294,7 +1292,7 @@ impl Conventional {
         // (none taken in for a call not recorded).
         let mut patterns = Vec::new();
         if !h.audio.is_empty() && l.call.recording {
-            let news = l.rec.push(&h.audio, h.frames, now_s);
+            let news = l.rec.push(&h.audio, &h.frames, now_s);
             changed |= CallManager::note_units(&mut l.call, &mut l.rec.tx, &news.units, now_s);
             // A new tone or code is news; a firmer reading of the same one isn't.
             changed |= l.rec.subaudible(&h.low).code.is_some();
@@ -1308,7 +1306,8 @@ impl Conventional {
         // (An encrypted transmission's audio, unless decrypted, is left out
         // when the call is saved, as a trunked call's is; it isn't played live.)
         if !h.audio.is_empty() && l.call.recording && !l.rec.tx.current_dropped() {
-            out.push(ConvOut::Event(Event::Audio { call_id: l.call.id, system: l.call.system, talkgroup: l.call.talkgroup, samples: h.audio, decrypted: l.call.decrypted_voice(false) }));
+            let c = &l.call;
+            out.push(ConvOut::Event(Event::Audio(LiveAudio { call_id: c.id, system: c.system, talkgroup: c.talkgroup, unit: c.talker().map_or(0, |s| s.src), samples: h.audio, frames: h.frames, decrypted: c.decrypted_voice(false) })));
         }
     }
 
