@@ -95,13 +95,13 @@ export interface SourceKind {
 }
 
 export const SOURCE_KINDS: Record<Source["type"], SourceKind> = {
-  rtlsdr: { label: "RTL-SDR", fresh: newDongle, get rates() { return sourceRates("rtlsdr"); }, device: "serial", soapyDriver: "rtlsdr", liveAgc: true },
+  rtlsdr: { label: "RTL-SDR", fresh: newDongle, get rates() { return sourceRates("rtlsdr"); }, rateHint: "2.4 or less is dependable", device: "serial", soapyDriver: "rtlsdr", liveAgc: true },
   usrp: {
     label: "USRP",
     fresh: newUsrp,
     get rates() { return sourceRates("usrp"); },
     freeRate: true,
-    rateHint: "MSPS; wider costs more CPU",
+    rateHint: "Wider costs more CPU",
     device: "args",
     driver: { name: "UHD", macos: "brew install uhd", linux: "sudo apt install libuhd-dev uhd-host", windows: "Ettus's UHD installer", then: "run uhd_images_downloader" },
     soapyDriver: "uhd",
@@ -114,7 +114,7 @@ export const SOURCE_KINDS: Record<Source["type"], SourceKind> = {
     device: "serial",
     driver: { name: "libairspy", macos: "brew install airspy", linux: "sudo apt install libairspy0", windows: "put airspy.dll (from airspy-tools) next to trunk-pro.exe" },
     soapyDriver: "airspy",
-    biasT: "Powers an LNA via the antenna cable",
+    biasT: "Powers an LNA on the antenna cable",
     liveAgc: true,
   },
   hydrasdr: {
@@ -138,7 +138,7 @@ export const SOURCE_KINDS: Record<Source["type"], SourceKind> = {
     fresh: newBladerf,
     get rates() { return sourceRates("bladerf"); },
     freeRate: true,
-    rateHint: "MSPS, 0.52–61.44 (the original bladeRF: up to 40)",
+    rateHint: "0.52–61.44 MSPS (original bladeRF: to 40)",
     device: "serial",
     driver: { name: "libbladeRF 2.x", macos: "brew install libbladerf", linux: "sudo apt install libbladerf2 bladerf-fpga-hostedxa4", windows: "Nuand's bladeRF installer" },
     soapyDriver: "bladerf",
@@ -149,7 +149,7 @@ export const SOURCE_KINDS: Record<Source["type"], SourceKind> = {
     fresh: newHackrf,
     get rates() { return sourceRates("hackrf"); },
     freeRate: true,
-    rateHint: "MSPS, 1–20",
+    rateHint: "1–20 MSPS",
     device: "serial",
     native: true,
     soapyDriver: "hackrf",
@@ -160,7 +160,7 @@ export const SOURCE_KINDS: Record<Source["type"], SourceKind> = {
     fresh: newSoapy,
     get rates() { return sourceRates("soapy"); },
     freeRate: true,
-    rateHint: "MSPS, one the device supports",
+    rateHint: "One the device supports",
     device: "args",
     driver: { name: "SoapySDR and your radio's module", macos: "brew install soapysdr soapyhackrf", linux: "sudo apt install soapysdr0.8-module-all", windows: "PothosSDR or radioconda" },
     covers: "SDRplay, LimeSDR, PlutoSDR…",
@@ -322,13 +322,13 @@ export function systemType(t: unknown): System["type"] {
 /** Frequencies a watching protocol (DMR, NXDN, EDACS) needs besides the control channels (the recorder's Site::watched_channels). */
 export function watchedChannels(sys: Pick<System, "type">, x: Site): number[] {
   if (sys.type === "edacs") return Object.entries(x.lcnTableHz ?? {}).filter(([k, f]) => +k >= 1 && +k <= 25 && f > 0).map(([, f]) => f);
-  return sys.type === "dmr" ? [...new Set([...(x.dmrChannelsHz ?? []), ...Object.values(x.lcnTableHz ?? {})])] : sys.type === "nxdn" ? (x.nxdnChannelsHz ?? []) : [];
+  return sys.type === "dmr" ? (x.dmrChannelsHz ?? []) : sys.type === "nxdn" ? (x.nxdnChannelsHz ?? []) : [];
 }
 
 /** A site's fields in an older config's system (before sites, each system was one, its fields at the top). */
 const SITE_KEYS = [
   "controlChannelsHz", "modulation", "expect", "voiceChannelsHz", "bandplan", "bandplanBaseHz", "bandplanSpacingHz", "bandplanOffset", "bandplanHighHz",
-  "lcnTableHz", "dmrChannelsHz", "dmrColorCodes", "xptHomeGroups", "colorCode", "nxdnRate", "nxdnChannelsHz", "ran", "esk",
+  "lcnTableHz", "dmrChannelsHz", "colorCode", "nxdnRate", "nxdnChannelsHz", "ran", "esk",
 ] as const satisfies readonly (keyof Site)[];
 
 /** Every key of System this version knows (the rest are kept as they are: a newer version's, a hand edit's). */
@@ -402,8 +402,6 @@ export function normalizeSite(x: Partial<Site>, sys: Pick<System, "type">): Site
       ? {
           ...(x.lcnTableHz && Object.keys(x.lcnTableHz).length ? { lcnTableHz: x.lcnTableHz } : {}),
           ...(x.dmrChannelsHz?.length ? { dmrChannelsHz: x.dmrChannelsHz } : {}),
-          ...(x.dmrColorCodes && Object.keys(x.dmrColorCodes).length ? { dmrColorCodes: x.dmrColorCodes } : {}),
-          ...(x.xptHomeGroups && Object.keys(x.xptHomeGroups).length ? { xptHomeGroups: x.xptHomeGroups } : {}),
           ...(typeof x.colorCode === "number" ? { colorCode: x.colorCode } : {}),
         }
       : {}),

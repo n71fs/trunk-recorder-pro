@@ -587,10 +587,21 @@ pub(crate) fn greeting_now(ctx: &Ctx, devices: Option<Value>, radios: Value, his
     // Each system's talker aliases; the codes conventional frequencies carried: as last told, else as saved.
     let (heard, units): (Vec<ToClient>, Vec<ToClient>) = kept.into_iter().partition(|k| matches!(k, ToClient::Heard { .. }));
     m.extend(units);
+    // Each system's MDC1200 radios, as the registry has them (their IDs shown in hex).
+    {
+        let radio = ctx.shared.radio.lock().unwrap();
+        for system in radio.systems.keys() {
+            let units = radio.mdc_units(system);
+            if !units.is_empty() {
+                m.push(ToClient::MdcUnits { system: system.clone(), units });
+            }
+        }
+    }
     m.extend(ctx.heard_last.lock().unwrap().clone().or_else(|| heard.into_iter().next()));
     m.push(history);
     m.push(ToClient::Radios { radios });
     m.push(ctx.survey_last.lock().unwrap().clone().unwrap_or_else(crate::survey::idle));
+    m.extend(ctx.tune.last());
     // The dashboard: recent notable events (oldest first), the computer as last sampled.
     m.extend(ctx.shared.recent_events().into_iter().map(|e| ToClient::MonitorEvent(body(e))));
     m.extend(ctx.host_last.lock().unwrap().clone());
@@ -620,6 +631,12 @@ struct Subs {
 }
 
 impl Subs {
+    fn new(ctx: &Arc<Ctx>, topics: std::collections::BTreeSet<String>) -> Subs {
+        let mut s = Subs { ctx: ctx.clone(), topics: Default::default() };
+        s.set(topics);
+        s
+    }
+
     fn set(&mut self, topics: std::collections::BTreeSet<String>) {
         let add: Vec<String> = topics.difference(&self.topics).cloned().collect();
         let remove: Vec<String> = self.topics.difference(&topics).cloned().collect();
@@ -707,7 +724,7 @@ async fn session(ctx: Arc<Ctx>, mut socket: WebSocket, door: Door) {
     };
     // Live audio: off until the browser asks; optionally one system and/or talkgroup only.
     let mut listen: Option<Listen> = None;
-    let mut subs = Subs { ctx: ctx.clone(), topics: Default::default() };
+    let mut subs = Subs::new(&ctx, Default::default());
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
@@ -727,8 +744,19 @@ async fn session(ctx: Arc<Ctx>, mut socket: WebSocket, door: Door) {
                         }
                         Out::Topic { topic, text } if subs.topics.contains(topic) => Message::Text(text.clone().into()),
                         Out::Topic { .. } => continue,
-                        Out::Audio { short_name, tg, frame } => match &listen {
-                            Some(l) if l.wants(short_name, *tg) => Message::Binary(frame.clone().into()),
+                        Out::Audio { short_name, tg, frame, voice } => match &listen {
+                            Some(l) if l.wants(short_name, *tg) => {
+                                if let (Some(_), Some(v)) = (&l.voice, voice)
+                                    && !send(&mut socket, Message::Text(v.clone().into())).await
+                                {
+                                    send(&mut socket, Message::Close(None)).await;
+                                    return;
+                                }
+                                if !l.audio {
+                                    continue;
+                                }
+                                Message::Binary(frame.clone().into())
+                            }
                             _ => continue,
                         },
                         Out::Quit => Message::Text(ToClient::Quit.to_json().into()),
@@ -816,6 +844,11 @@ async fn plugins_list(ctx: &Arc<Ctx>) -> ToClient {
 struct Listen {
     system: Option<String>,
     talkgroup: Option<u32>,
+    /// The PCM (type 2).
+    audio: bool,
+    /// The vocoder frames (`voice` messages): watched as topic `voice`, so
+    /// they're built while it lasts.
+    voice: Option<Subs>,
 }
 
 impl Listen {
@@ -898,6 +931,8 @@ async fn command(ctx: &Arc<Ctx>, cmd: Command, listen: &mut Option<Listen>, subs
                 // A radio's gain changed while recording: it takes it now (the ones that can), the
                 // rest at the next start, which the log says; the banner says whether a restart waits.
                 for (i, g) in ctx.live_sources(&old, &c) {
+                    // A radio whose gain is being tuned: the edit wins.
+                    ctx.tune.edited(&c.sources[i]);
                     if let Some(g) = g {
                         log::info!("{}: gain changed while recording, applied now: {g}", c.sources[i].title(i));
                     } else {
@@ -1093,6 +1128,19 @@ async fn command(ctx: &Arc<Ctx>, cmd: Command, listen: &mut Option<Listen>, subs
                 Err(e) => ToClient::CallSignResult { id, results: vec![], error: Some(e) },
             })
         }
+        // (The plan asks the engine for its sites: off the async workers.)
+        Command::TuneGain(req) => {
+            let ctx2 = ctx.clone();
+            match tokio::task::spawn_blocking(move || crate::tune::start(&ctx2, req)).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(e)) => Some(ToClient::error(e)),
+                Err(e) => Some(ToClient::error(e.to_string())),
+            }
+        }
+        Command::TuneStop => {
+            ctx.tune.stop("asked to stop");
+            None
+        }
         Command::SurveyStop => {
             let ctx2 = ctx.clone();
             let _ = tokio::task::spawn_blocking(move || ctx2.stop_survey()).await;
@@ -1222,8 +1270,8 @@ async fn command(ctx: &Arc<Ctx>, cmd: Command, listen: &mut Option<Listen>, subs
             crate::interfaces::serve::reconcile(ctx.clone()).await;
             failed(r)
         }
-        Command::Listen { on, system, talkgroup } => {
-            *listen = on.then_some(Listen { system, talkgroup });
+        Command::Listen { on, system, talkgroup, voice, audio } => {
+            *listen = on.then(|| Listen { system, talkgroup, audio, voice: voice.then(|| Subs::new(ctx, ["voice".to_string()].into())) });
             None
         }
     }
@@ -1452,10 +1500,10 @@ mod tests {
     /// Live audio is asked for by a system's short name.
     #[test]
     fn listening_by_short_name() {
-        let l = Listen { system: Some("dcfd".into()), talkgroup: None };
+        let l = Listen { system: Some("dcfd".into()), talkgroup: None, audio: true, voice: None };
         assert!(l.wants("dcfd", 101) && !l.wants("wmata", 101));
-        let l = Listen { system: Some("wmata".into()), talkgroup: Some(101) };
+        let l = Listen { system: Some("wmata".into()), talkgroup: Some(101), audio: true, voice: None };
         assert!(l.wants("wmata", 101) && !l.wants("wmata", 102) && !l.wants("dcfd", 101));
-        assert!(Listen { system: None, talkgroup: None }.wants("conv", 7));
+        assert!(Listen { system: None, talkgroup: None, audio: true, voice: None }.wants("conv", 7));
     }
 }

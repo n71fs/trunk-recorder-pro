@@ -48,7 +48,7 @@ than one radio can cover needs a wider radio or several radios.
 
 **Center frequency, MHz** is the middle of the radio's slice. Leave it blank and the recorder
 places the radio itself (**Auto**); the hint under the field shows where it went
-(`Auto: 858.3000 MHz`), or *Auto: no uncovered system to place over* when there's nothing left
+(`Auto: 858.3000 MHz`), or *Auto: nothing left to cover* when there's nothing left
 for it to cover.
 
 How Auto chooses, for each source in order whose center is blank:
@@ -84,7 +84,7 @@ names the systems with channels inside, or says *nothing in range*. Hover over a
 it is.
 
 On the **Systems** tab, each system card says which source its control channel is on, and, when
-the survey has found voice channels, how many are covered ("voice 14/16 covered").
+the survey has found voice channels, how many are covered ("Voice 14/16").
 
 ## Guard band and roll-off
 
@@ -163,6 +163,11 @@ How to set it:
 - **Let the survey do it.** On an RTL-SDR, Find my system tries gains from 19.7 to 49.6 dB while
   listening to the control channel and keeps the lowest one within 1 dB of the best signal that
   doesn't clip. See [Find my system](find-my-system.md#gain).
+- **Let `trunk-pro tune` do it.** While recording, `trunk-pro tune` tries gains on the radio,
+  following a plan for its kind (an Airspy along its linearity table, an RTL-SDR along its tuner's
+  gains, a HackRF's LNA before its VGA and its amp last), and scores each by what that radio's
+  systems decode: control channel first, then voice. Nothing is saved while it tries; the radio
+  goes back unless you pass `--apply`. See the [command line](../command-line.md#tune).
 - **Watch the dashboard.** While recording, a source's line warns *the gain is too high* when more
   than 0.5 % of samples are at full scale, and *little headroom left* when peaks reach full scale.
   Lower it a few dB. The **RF** page shows each radio's headroom and noise floor over time.
@@ -242,7 +247,7 @@ Auto placement follows these: a radio something is kept on is placed for it, and
 use isn't placed for what's kept elsewhere. Setup's coverage chips and the dashboard's "not needed"
 note go by the same choice.
 
-A call whose frequency no source covers isn't recorded; a system's page under **Radio system** says *outside tuned
+A call whose frequency no source covers isn't recorded; a system's page under **Radio system** says *out of
 range*, and the **Radio system** page counts these as *Out of band* (*No source covers the
 frequency*) and lists their frequencies, with the nearest source and how far past its usable edge each is. A system with no control channel inside any source can't start: *no control channel
 falls inside a source's bandwidth — move the center frequency*.

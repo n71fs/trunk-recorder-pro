@@ -136,6 +136,7 @@ mod toolkit;
 mod protocol_tests;
 mod survey;
 mod tool;
+mod tune;
 mod unlock;
 
 pub use trunk_app::config;
@@ -262,6 +263,11 @@ usage:
   trunk-pro rolloff <capture> --center Hz --rate Hz [--format cu8|cs16|cf32] [--full]
       How far in from each edge of the band the noise floor sags, and the
       guard band to leave there (--full: with the spectra and waterfall).
+  trunk-pro tune [--url http://127.0.0.1:8080] [--source N] [--systems a,b] [--rounds 3] [--apply]
+      Ask a recorder that is recording to tune a radio's gain: it follows a
+      plan for the radio's kind, compares each candidate with the best so far
+      by turns, and finds the one its systems decode best at (control channel,
+      then voice). Nothing is saved unless --apply. tune --help: more.
   trunk-pro tool cc|voice|frames|p2 <capture.cu8> --center Hz --rate Hz (--cc Hz | --freq Hz) …
       One P25 channel's decode as JSON lines (diagnostics; frames: counts
       of each frame type; p2: a Phase 2 channel, --nac --sysid --wacn).
@@ -322,6 +328,7 @@ fn main() {
         Some("capture") => capture(&Args::parse(&argv[1..])),
         Some("survey") => survey::cli(&Args::parse(&argv[1..])),
         Some("rolloff") => profile::cli(&Args::parse(&argv[1..])),
+        Some("tune") => tune::cli(&Args::parse(&argv[1..])),
         Some("plugin") => plugins::cli::run(&Args::parse(&argv[1..])),
         Some("interface") => interfaces::cli::run(&Args::parse(&argv[1..])),
         _ => die(USAGE),
@@ -486,7 +493,6 @@ fn replay(a: &Args) {
                 channels: hz_list("dmr-channels"),
                 lcn_table: lcn_table(a),
                 color_code: a.get("color-code").and_then(|v| v.parse().ok()),
-                ..Default::default()
             }) {
                 Some(dc) => Protocol::Dmr(dc),
                 None if a.get("nxdn-trunk").is_some() => {
@@ -674,22 +680,16 @@ fn replay(a: &Args) {
     }
     let st = engine.status();
     println!("\n{air_s:.1} s of air in {cpu:.2} s ({:.0}× real time). {written} call(s) written to {out_dir}/", air_s / cpu);
-    let hex = |v: Option<u32>| v.map_or("?".into(), |v| format!("{v:x}"));
-    let dec = |v: Option<u32>| v.map_or("?".into(), |v| v.to_string());
     for s in &st.sites {
-        let id = &s.identity;
+        let id = s.identity.describe(s.id_fields);
         println!(
-            "  {}: CC {} good / {} bad {}, {}, NAC {} WACN {} SysID {} RFSS {} site {}, {} call(s){}",
+            "  {}: CC {} good / {} bad {}, {}{}, {} call(s){}",
             if s.site_name == s.short_name { s.short_name.clone() } else { format!("{}/{}", s.short_name, s.site_name) },
             s.good,
             s.bad,
-            if s.modulation == "2FSK" { "OSWs" } else { "TSBKs" },
+            s.blocks,
             s.modulation,
-            hex(id.get(IdField::Nac)),
-            hex(id.wacn()),
-            hex(id.sys_id()),
-            dec(id.rfss()),
-            dec(id.site()),
+            if id.is_empty() { id } else { format!(", {id}") },
             s.calls_concluded,
             s.mismatch.as_ref().map_or(String::new(), |m| format!(" — NOT FOLLOWED: {m}")),
         );
@@ -873,7 +873,7 @@ fn capture(a: &Args) {
                 dropped += d;
             }
             Ok(sdr::SourceMsg::Error { error, .. }) => eprintln!("{error}"),
-            Ok(sdr::SourceMsg::Samples { .. } | sdr::SourceMsg::Tuned { .. }) => {}
+            Ok(sdr::SourceMsg::Samples { .. } | sdr::SourceMsg::Tuned { .. } | sdr::SourceMsg::Gain { .. }) => {}
             Ok(sdr::SourceMsg::End { .. }) | Err(_) => break,
         }
     }
@@ -1013,6 +1013,7 @@ fn serve(a: &Args) {
         db,
         quit: tokio::sync::Notify::new(),
         survey_last: Mutex::new(None),
+        tune: Default::default(),
         plugins: plugins::manage::Plugins::new(hub.clone(), shared.clone()),
         bind: addr.ip(),
         interfaces: interfaces::Interfaces::new(dev, addr.port()),

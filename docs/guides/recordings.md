@@ -160,7 +160,7 @@ It is written on a single line.
 | `patched_talkgroups` | Only when the talkgroup was patched with others: all of them |
 | `freqList` | One entry for the call: `freq`, `time`, `pos` (0), `len` (seconds of audio), `error_count` (FEC errors), `spike_count` (0) |
 | `errorList` | Per 10 s of audio: `pos`, `len`, `frames`, `error_count`, `bad_frames` (repeated, muted or erased), `max_frame_errors` |
-| `srcList` | Each radio heard: `src` (unit ID), `time`, `pos` (seconds into the call), `emergency`, `signal_system` (empty), `tag` (its name), `tag_ota` (its talker alias), and `lat` and `lon` when it sent its GPS position (P25, Motorola and L3Harris radios) |
+| `srcList` | Each radio heard: `src` (unit ID), `time`, `pos` (seconds into the call), `emergency`, `signal_system` (`MDC1200` or `FLEETSYNC` for an analog radio's ID, else empty), `tag` (its name), `tag_ota` (its talker alias), and `lat` and `lon` when it sent its GPS position (P25, Motorola and L3Harris radios) |
 | `tones` | Only when the voice carried any: each in-band tone in order, `type` (`dtmf`, `knox`, `call_progress`, or `tone` for a single tone), `value` (the digit, `350+440`, or the tone's Hz), `pos` and `len` (seconds), `src` (the radio talking, `0` if not known), `origin` (`frame`: named by a half-rate vocoder's tone frames, so P25 Phase 2, DMR and NXDN; `audio`: found in the audio, so P25 Phase 1, analog FM and AM, and half-rate voice sent without tone frames), and `level` (dBm0, tone frames) |
 | `tone_patterns` | Only when the voice carried any: what the tones make up, in order. `pattern` (`two_tone`, `long`, `hi_low` warble, `pulsed`, `digits` DTMF / KNOX, `morse` (a CW ID), `sequence` of short tones, `beep`), `tones` (Hz: two-tone A then B), `lengths` (seconds; Morse: its dot), `digits` and `knox` for digit strings (Morse: the text), `cycles` (hi-low tones, pulses), `format` (a two-tone page's timing, by Midian's paging timings: `Quick Call II` 1 s + 3 s, `Quick Call II battery save` 2.7 s + 0.8 s, `Quick Call I` 1 s, 0.2 s gap, 1 s, `GE Type 99` 1 s + 1.5 s, `NEC A`, …), `pos`, `len`, `src`, `origin`, `text` (it in words: `two-tone 781.25 → 875 Hz, 0.98 + 2.98 s (Quick Call II)`), and `signals` (the ids of the system's [signals](../configuration/systems.md#signals) it is) |
 | `signals` | Only when the call carried any of its system's [signals](../configuration/systems.md#signals): their ids, in the order first heard |
@@ -184,13 +184,12 @@ Before a call is saved:
 1. **Short transmissions and encrypted ones are cut out.** Transmissions shorter than **Shortest
    transmission, s** are removed. Encrypted transmissions are always removed: what a vocoder makes of
    them is noise.
-2. **Loudness is evened out** (**Even out call loudness**, on by default). Each call's speech is
+2. **Loudness is evened out** (**Even out loudness**, on by default). Each call's speech is
    brought to about -18.5 LUFS, close to the level Trunk Recorder's uploads have. The gain is
    limited to between -18 dB and +24 dB, and a limiter keeps peaks below -2.5 dBFS. A call with less
    than 0.2 s of speech (a keyed radio sending silence, a squelch tail) is left alone rather than
    having its hiss brought up.
-3. **Your level adjustment is applied:** **Digital Level Adjustment, dB** or **Analog Level
-   Adjustment, dB** (-20 to +20 in the interface).
+3. **Your level adjustment is applied:** **Digital level, dB** or **Analog level, dB** (-20 to +20 in the interface).
 
 Analog FM audio is also de-emphasised (750 µs) and high-passed at 300 Hz when it is demodulated,
 which removes CTCSS tones from what you hear.
@@ -276,7 +275,7 @@ A call that is only uploaded, then deleted, still gets written to disk and erase
 or SD card that runs for months, that's wear for nothing. The RAM spool keeps those files in memory
 instead.
 
-Turn on **Keep calls waiting to upload in memory** on the Recording tab and set **RAM spool size,
+Turn on **RAM spool** on the Recording tab and set **RAM spool size,
 MB** (256 by default). It takes effect the next time recording starts.
 
 - **macOS:** the app makes a RAM disk of that size (no administrator password needed), mounted out
@@ -336,7 +335,7 @@ override them under **Recording** in the **Recording** group of its card; each o
 
 **What is recorded**
 
-- **Talkgroups not in the talkgroup file** (`recordUnknown`, on): applies only when a system has a
+- **Unlisted talkgroups** (`recordUnknown`, on): applies only when a system has a
   talkgroup list. A talkgroup patched with a listed one is recorded anyway.
 - **Unit-to-unit calls** (`recordUnitToUnit`, on): private calls between two radios.
 - **Call timeout, s** (`callTimeoutS`, 3): a call ends this long after its last grant or audio.
@@ -364,15 +363,15 @@ A call that isn't kept logs `Call not saved - no audio, or shorter than the mini
 
 ## Capture what TRP receives
 
-The **Capture what TRP receives** card at the bottom of the **RF** page records what TRP is receiving, to replay
+The **IQ capture** card at the bottom of the **RF** page records what TRP is receiving, to replay
 later or to send in when something isn't working. Pick what to capture, say whether it shows **A problem** or
 **Everything working**, add a note if you like, and press the button. Recording carries on as usual. Nothing is sent anywhere.
 
 | Capture | What it records | Use it for |
 |---|---|---|
-| **A control channel** | One site's control channel, for 30 or 60 seconds from when you press it (a DMR site: each of its frequencies) | Calls that aren't granted or followed, a control channel that decodes badly. A few MB. |
-| **The next call** | The voice channel of the next call to begin on a system, or on one talkgroup, from start to end | Calls that sound bad, are silent or go missing |
-| **Everything the radios receive** | Every radio, for 30, 60 or 120 seconds | A problem that isn't one channel's, or a known-good sample of your system to test new versions against |
+| **Control channel** | One site's control channel, for 30 or 60 seconds from when you press it (a DMR site: each of its frequencies) | Calls that aren't granted or followed, a control channel that decodes badly. A few MB. |
+| **Next call** | The voice channel of the next call to begin on a system, or on one talkgroup, from start to end | Calls that sound bad, are silent or go missing |
+| **Every radio** | Every radio, for 30, 60 or 120 seconds | A problem that isn't one channel's, or a known-good sample of your system to test new versions against |
 
 A capture that waits on the air (a control channel's time, or the next call) is listed under the button with how it's
 going, and **Cancel** gives it up. A channel capture is replayed with `trunk-pro tool channel <folder>`.

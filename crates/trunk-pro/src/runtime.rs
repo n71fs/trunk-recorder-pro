@@ -44,8 +44,10 @@ pub enum Out {
     /// Only for browsers that subscribed to `topic` (see [`trunk_app::stats::Topics`]).
     Topic { topic: String, text: String },
     /// Live audio (binary frame) for talkgroup `tg` of the system with short
-    /// name `short_name` (the frame carries the system's number this run).
-    Audio { short_name: String, tg: u32, frame: Vec<u8> },
+    /// name `short_name` (the frame carries the system's number this run);
+    /// `voice`: its vocoder frames as a `voice` message, sent just before it
+    /// to connections listening with `voice` (none: no one is, or analog).
+    Audio { short_name: String, tg: u32, frame: Vec<u8>, voice: Option<String> },
     /// The recorder is quitting: every connection is told, then closed.
     Quit,
 }
@@ -146,6 +148,8 @@ pub struct Ctx {
     pub unlocked: crate::unlock::Unlocked,
     /// Recordings of what the radios receive ([`crate::iq_capture`]).
     pub iq: crate::iq_capture::Captures,
+    /// A radio's gain being tuned ([`crate::tune`]), and its last report (for browsers that connect).
+    pub tune: crate::tune::Slot,
 }
 
 /// Something for the running session to do: the one way into the engine
@@ -180,6 +184,8 @@ pub enum EngineCmd {
     IqKeepTapes { on: bool },
     /// The control channels' latest tapes, and what a capture keeps of the session.
     IqControl { done: mpsc::Sender<(Vec<trunk_core::trunk::tape::ControlTape>, crate::iq_capture::Live)> },
+    /// The sites running, each with the source its control channel is on (the gain tuner's systems).
+    Sites { done: mpsc::Sender<Vec<trunk_core::trunk::SiteStatus>> },
 }
 
 impl Ctx {
@@ -248,6 +254,10 @@ impl Ctx {
     }
 
     pub fn set_phase(&self, phase: Phase, error: Option<String>, ended: bool) {
+        // A gain being tuned stops with the recording (the radio is closed: nothing to put back).
+        if phase != Phase::Running {
+            self.tune.recording_ended();
+        }
         if phase == Phase::Idle {
             *self.run.lock().unwrap() = None;
         }
@@ -456,6 +466,21 @@ impl Ctx {
             out.push((i, gain));
         }
         out
+    }
+}
+
+impl Ctx {
+    /// Put `src` (the run's source `k`, its gain changed) on the air as a
+    /// trial: the radio takes it now, and nothing is saved or told — the run
+    /// still has what it had ([`Ctx::run`]), which is what it goes back to.
+    pub fn trial_gain(&self, k: usize, src: &Source) -> Result<Gain, String> {
+        let l = self.lifecycle.lock().unwrap();
+        let Some(r) = l.recording.as_ref().filter(|r| !r.finished()) else { return Err("recording stopped".into()) };
+        let run = self.run.lock().unwrap();
+        let now = run.as_ref().and_then(|c| c.sources.get(k)).ok_or("the radio isn't recording")?;
+        let gain = live_gain(now, src).ok_or("this radio takes that gain only at the next start")?;
+        *r.controls.get(k).ok_or("the radio isn't recording")?.gain.lock().unwrap() = Some(gain);
+        Ok(gain)
     }
 }
 
@@ -1083,6 +1108,8 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<m
         while let Some(c) = next {
             match c {
                 EngineCmd::Source(SourceMsg::Error { source, error }) => session.source_error(source, &error),
+                // (The one place a radio's gain set is weighed against the gain asked for.)
+                EngineCmd::Source(SourceMsg::Gain { source, asked, set }) => session.source_gain(source, &asked.to_string(), (!asked.same(&set)).then(|| set.to_string())),
                 EngineCmd::Source(SourceMsg::End { source }) => {
                     if session.source_ended(source) {
                         // (Not "ended" when the user stopped it: the file thread ends on stop too.)
@@ -1131,6 +1158,9 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<m
                     let _ = done.send((session.control_tapes(), iq_live(&session)));
                 }
                 EngineCmd::IqKeepTapes { on } => session.keep_tapes(on),
+                EngineCmd::Sites { done } => {
+                    let _ = done.send(session.sites());
+                }
             }
             next = rx.try_recv().ok();
         }
@@ -1150,6 +1180,7 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<m
         if radio_at.elapsed() >= Duration::from_secs(5) {
             radio_at = Instant::now();
             ctx.clock.set_radio(session.radio_clocks());
+            session.clock_sync = ctx.clock.sync_kind().map(str::to_string);
         }
     }
     *ctx.engine.lock().unwrap() = None;
@@ -1303,13 +1334,17 @@ fn deliver(ctx: &Arc<Ctx>, out: &mut Vec<Output>, plugins: Option<&PluginHost>, 
                 if matches!(m, ToClient::Heard { .. }) {
                     *ctx.heard_last.lock().unwrap() = Some(m.clone());
                 }
+                if let ToClient::Stats { t, values } = &m {
+                    ctx.tune.stats(*t, values);
+                }
                 publish(&ctx.hub, m)
             }
-            Output::Audio { short_name, unit_name, audio } => {
+            Output::Audio { short_name, audio, voice, voice_listened } => {
                 if let Some(p) = plugins {
-                    p.live(&short_name, &unit_name, &audio);
+                    p.live(&short_name, &audio, voice.as_ref());
                 }
-                let _ = ctx.hub.send(Arc::new(Out::Audio { short_name, tg: audio.talkgroup, frame: trunk_app::session::audio_frame(&audio) }));
+                let voice = voice.filter(|_| voice_listened).map(|chunk| ToClient::Voice { chunk }.to_json());
+                let _ = ctx.hub.send(Arc::new(Out::Audio { short_name, tg: audio.talkgroup, frame: trunk_app::session::audio_frame(&audio), voice }));
             }
             Output::Plugin(m) => {
                 if let Some(p) = plugins {

@@ -76,6 +76,10 @@ pub enum ToClient {
     /// A system's talker aliases as saved (Trunk Recorder's unitTagsOTA CSV):
     /// one for each system with some, on connecting (then `unitAlias` for each new one).
     Units { system: String, csv: String },
+    /// A system's radios whose IDs came in MDC1200 (the radio registry's):
+    /// one for each system with some, on connecting (then each call's
+    /// `srcList` says it). Their IDs are shown in hex.
+    MdcUnits { system: String, units: Vec<u32> },
     /// Which key containers are unlocked.
     Keys { sources: Value },
     Radios { radios: Value },
@@ -102,6 +106,10 @@ pub enum ToClient {
     /// each interface makes the same edit to its copy (`unitNamesEdit`).
     UnitNameEdited { system: String, unit: u32, name: String, origin: Origin },
     Status { status: Value, sources: Vec<Value>, load: f64, calls: Vec<Value> },
+    /// Live voice as vocoder frames ([`crate::session::voice_chunk`]), beside
+    /// its live audio: only to connections listening with `voice`. `chunk` is
+    /// the `voice` plugin topic's, as it is.
+    Voice { chunk: trunk_recorder_plugin::VoiceChunk },
     Spectrum { source: usize, center_hz: f64, rate_hz: f64, bins: Vec<f32> },
     Log { lines: Vec<Value> },
     /// A call stored: its history entry.
@@ -112,6 +120,8 @@ pub enum ToClient {
     Heard { heard: Value },
     Survey(Body),
     SurveySpectrum { source: usize, center_hz: f64, rate_hz: f64, bins: Vec<f32> },
+    /// A radio's gain being tuned ([`Command::TuneGain`]), each time it moves; on connecting, the last.
+    Tune(crate::tune::TuneReport),
     /// Answers `licenseQuery`, to its sender: the API's `results`, or why there are none.
     LicenseResult { id: u64, results: Vec<Value>, error: Option<String> },
     /// Answers `callSignQuery`, to its sender: each active call sign's holder, or why there are none.
@@ -389,6 +399,8 @@ pub enum Capability {
     /// The dashboard's history further back than a week (`statsQuery`'s
     /// `30d`, `90d`, `1y`), as far as `storage.statsDays` keeps: the store.
     History,
+    /// Tuning a radio's gain while recording: `tuneGain`.
+    TuneGain,
 }
 
 impl Capability {
@@ -416,7 +428,7 @@ impl ToClient {
     pub fn audience(&self) -> Audience {
         use ToClient::*;
         match self {
-            Plugins(_) | PluginRuntime { .. } | Interfaces(_) | Store { .. } | InstallProgress { .. } | Keys { .. } => Audience::Control,
+            Plugins(_) | PluginRuntime { .. } | Interfaces(_) | Store { .. } | InstallProgress { .. } | Keys { .. } | Tune(_) => Audience::Control,
             _ => Audience::Everyone,
         }
     }
@@ -524,7 +536,20 @@ pub enum Command {
     FindRadios,
     ListDir { #[serde(default)] path: String },
     ReadTrConfig { path: String },
-    Listen { on: bool, #[serde(default)] system: Option<String>, #[serde(default)] talkgroup: Option<u32> },
+    /// Live audio, optionally of one system and/or talkgroup. `voice`: also
+    /// digital calls' vocoder frames ([`ToClient::Voice`]); `audio: false`:
+    /// those alone, without the PCM.
+    Listen {
+        on: bool,
+        #[serde(default)]
+        system: Option<String>,
+        #[serde(default)]
+        talkgroup: Option<u32>,
+        #[serde(default)]
+        voice: bool,
+        #[serde(default = "crate::config::yes")]
+        audio: bool,
+    },
     UnlockKeys { source: String, password: String },
     LockKeys { source: String },
     ChannelFile { index: usize, path: String },
@@ -532,6 +557,12 @@ pub enum Command {
     SurveyListen { freq_hz: f64 },
     SurveyRescan,
     SurveyStop,
+    /// Tune a radio's gain by what its systems decode, while recording
+    /// ([`crate::tune`]): each candidate is set on the radio as a trial, not
+    /// saved; at the end it goes back, or, with `apply`, the best is saved.
+    TuneGain(crate::tune::TuneRequest),
+    /// Stop tuning: the radio goes back as it was.
+    TuneStop,
     /// Who is licensed on `signals` within `radius_m` of the location the
     /// user gave (sent to trunkrecorder.pro): answered with `licenseResult`.
     LicenseQuery { id: u64, lat: f64, lon: f64, radius_m: f64, signals: Vec<crate::licenses::Signal> },
@@ -670,6 +701,8 @@ mod tests {
     fn a_message_is_its_type_and_its_fields() {
         let m = ToClient::UnitAlias { system: "dcfd".into(), unit: 7, alias: "E1".into() };
         assert_eq!(m.to_json(), r#"{"type":"unitAlias","system":"dcfd","unit":7,"alias":"E1"}"#);
+        let m = ToClient::MdcUnits { system: "conv".into(), units: vec![1795, 7187] };
+        assert_eq!(m.to_json(), r#"{"type":"mdcUnits","system":"conv","units":[1795,7187]}"#);
         assert_eq!(ToClient::Quit.to_json(), r#"{"type":"quit"}"#);
         let s = ToClient::Spectrum { source: 1, center_hz: 2.0, rate_hz: 3.0, bins: vec![] };
         assert_eq!(s.to_json(), r#"{"type":"spectrum","source":1,"centerHz":2.0,"rateHz":3.0,"bins":[]}"#);
@@ -683,7 +716,9 @@ mod tests {
     #[test]
     fn commands_are_read_strictly_and_listen_may_only_look() {
         let c = Command::parse(r#"{"type":"listen","on":true,"system":"dcfd"}"#).unwrap();
-        assert!(matches!(&c, Command::Listen { on: true, system: Some(s), talkgroup: None } if s == "dcfd") && c.listen_may_send());
+        assert!(matches!(&c, Command::Listen { on: true, system: Some(s), talkgroup: None, voice: false, audio: true } if s == "dcfd") && c.listen_may_send());
+        let c = Command::parse(r#"{"type":"listen","on":true,"voice":true,"audio":false}"#).unwrap();
+        assert!(matches!(&c, Command::Listen { on: true, system: None, voice: true, audio: false, .. }) && c.listen_may_send());
         assert!(matches!(Command::parse(r#"{"type":"install","kind":"plugin","repository":"a/b"}"#), Ok(Command::Install { kind: StoreKind::Plugin, what: Install::Release { tag: None, .. } })));
         assert!(matches!(Command::parse(r#"{"type":"install","kind":"interface","id":"trunkamp"}"#), Ok(Command::Install { kind: StoreKind::Interface, what: Install::Listed { .. } })));
         let e = Command::parse(r#"{"type":"channelFile","index":0}"#).err().unwrap();

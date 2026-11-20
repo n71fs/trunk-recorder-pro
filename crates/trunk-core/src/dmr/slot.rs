@@ -413,8 +413,11 @@ impl SlotDecoder {
 #[derive(Default)]
 pub struct Channel {
     pub slots: [SlotDecoder; 2],
-    /// Positive XPT signaling observed on this receiver. FID alone is insufficient.
-    pub xpt: bool,
+    /// The kind of trunked system this carrier belongs to, once known: its
+    /// site's, its control channel's (a voice channel's [`VoiceParams`](crate::trunk::voice::VoiceParams)),
+    /// or XPT signalling heard on it (FID alone is not enough). XPT link
+    /// control reaches the decoders with its 16-bit IDs ([`super::xpt::voice_lc`]).
+    pub variant: Option<super::trunking::Variant>,
     short_lc: super::short_lc::Assembler,
     last_slot: u8,
     /// Bursts whose CACH didn't decode (the slot was inferred).
@@ -475,10 +478,10 @@ impl Channel {
             // A repeater after all: its CACH names the slots.
             self.anchor = None;
         }
+        let start = out.len();
         let (tact, fragment) = cach(&b.cach);
         if self.anchor.is_none() {
             if let Some(raw) = self.short_lc.push(tact.map(|t| t.lcss), fragment) {
-                self.xpt |= super::xpt::slco(&raw).is_some();
                 out.push((slot, SlotEvent::Slco(raw)));
             }
         } else {
@@ -491,13 +494,32 @@ impl Channel {
         if k[slot as usize].keyed != k[1 - slot as usize].keyed && k[slot as usize].keyed {
             k[1 - slot as usize].keyed = true;
         }
-        for e in &self.ev {
-            self.xpt |= match e {
-                SlotEvent::Csbk { csbk, mbc: false } => super::xpt::csbk(&csbk.0).is_some(),
-                SlotEvent::Lc { lc, .. } => super::xpt::flco(&lc.0).is_some(),
-                _ => false,
-            };
-        }
         out.extend(self.ev.drain(..).map(|e| (slot, e)));
+        if out[start..].iter().any(|(_, e)| super::xpt::control(e).is_some()) {
+            self.variant = Some(super::trunking::Variant::Xpt);
+        }
+        if self.variant == Some(super::trunking::Variant::Xpt) {
+            for (_, e) in &mut out[start..] {
+                if let SlotEvent::Lc { lc, .. } = e {
+                    *lc = super::xpt::voice_lc(*lc);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn hytera_setup_keeps_16_bit_ids_without_voice_flags() {
+        let setup = Lc([0xc9, FID_HYTERA, 0xc7, 0x30, 0, 25, 0xaa, 0x12, 0x34]);
+        assert_eq!((setup.target(), setup.source()), (25, 0x1234));
+        assert!(!setup.encrypted() && !setup.emergency());
+        assert!(setup.voice_user().is_none());
+        let voice = Lc([0, FID_HYTERA, 0xc0, 0x30, 0, 25, 0xaa, 0x12, 0x34]);
+        assert_eq!((voice.target(), voice.source()), (0x300019, 0xaa1234));
+        assert!(voice.encrypted() && voice.emergency());
     }
 }

@@ -5,7 +5,7 @@
 
 import { activeSystems, autoTuneOn, siteActive, siteNameOf, usableHalfWidth } from "../config.ts";
 import { isRecording, can, setView, snapshot, statsQuery, useApp, usePolled, type AppState, type StatsRange, type View } from "../controller.ts";
-import { dur, keyPart, num, pct } from "../fmt.ts";
+import { dur, keyPart, num, pct, signed } from "../fmt.ts";
 import { seriesPoints } from "../series.ts";
 import type { Level } from "../charts.tsx";
 import type { PluginInfo, SeriesData, SiteDetail, SiteStatus, SourceStatus, StorageSettings, SystemStatus } from "../protocol.ts";
@@ -16,9 +16,39 @@ export const K = {
   sys: (short: string, k: string) => `sys/${keyPart(short)}/${k}`,
   /** A site's control channel series (the recorder's SiteConfig::stats_key). */
   cc: (site: DashSite, k: string) => `${site.key}/cc/${k}`,
+  /** A conventional frequency's series key (the recorder's metrics::channel_key). */
+  ch: (short: string, hz: number) => `sys/${keyPart(short)}/ch/${Math.round(hz)}`,
   src: (label: string, k: string) => `src/${keyPart(label)}/${k}`,
   plg: (id: string, k: string) => `plg/${keyPart(id)}/${k}`,
 };
+
+/** Series `name` under each of `scopes` (a system's, a site's: `[site.key]`). */
+export const scoped = (scopes: string[], name: string) => scopes.map((k) => `${k}/${name}`);
+
+/** The vocoders a site's or channel's frames are counted by (`voice/<codec>/…`). */
+export const CODECS = ["imbe", "ambe"];
+
+/** Voice series `name` (`frames`, `bad`, `errors`) of every codec under `scopes`. */
+export const voiceKeys = (scopes: string[], name: string) => CODECS.flatMap((c) => scoped(scopes, `voice/${c}/${name}`));
+
+/** [`recentAvg`] of `keys`, added up (null: none of them has any). */
+export function recentSum(keys: string[], sinceS: number): number | null {
+  const v = keys.map((k) => recentAvg(k, sinceS)).filter((x): x is number => x !== null);
+  return v.length ? v.reduce((a, b) => a + b, 0) : null;
+}
+
+/** History series `keys` added up step by step (each step null where none of them has a value). */
+export function sumSeries(hist: Record<string, SeriesData> | null | undefined, keys: string[]): SeriesData | undefined {
+  const all = keys.map((k) => hist?.[k]).filter((x): x is SeriesData => !!x);
+  if (!all.length) return undefined;
+  const [a] = all;
+  const same = all.filter((x) => x.t0 === a.t0 && x.stepS === a.stepS);
+  const v = a.v.map((_, i) => {
+    const xs = same.map((x) => x.v[i]).filter((x): x is number => x !== null);
+    return xs.length ? xs.reduce((p, q) => p + q, 0) : null;
+  });
+  return { ...a, v, lo: v.map(() => null), hi: v.map(() => null) };
+}
 
 /** A value now, from the latest stats / host message. */
 export function val(s: AppState, key: string): number | null {
@@ -53,6 +83,9 @@ export interface DashSystem {
   status: SystemStatus | null;
   /** Its sites being recorded (a conventional system: none). */
   sites: DashSite[];
+  /** Where its copies of calls are counted (`<key>/calls/…`, `<key>/voice/…`): each site's key,
+   * or (conventional) each channel's. A system's figures are their sum ([`scoped`]). */
+  scopes: string[];
 }
 
 /** One site of a dashboard system. */
@@ -76,12 +109,13 @@ export function dashSystems(s: AppState): DashSystem[] {
       const name = siteNameOf(x, site);
       return { name, key: siteKey(x.shortName, name), status: status?.sites.find((y) => y.name === name) ?? null };
     });
-    return { name: x.shortName, kind: (x.type ?? "p25") as DashSystem["kind"], status, sites };
+    return { name: x.shortName, kind: (x.type ?? "p25") as DashSystem["kind"], status, sites, scopes: sites.map((y) => y.key) };
   });
   for (const c of s.config.conventional) {
     if (c.enabled === false || !c.channels.some((ch) => ch.enabled)) continue;
     const status = s.status?.systems.find((y) => y.shortName === c.shortName) ?? null;
-    out.push({ name: c.shortName, kind: "conventional", status, sites: [] });
+    const scopes = [...new Set(c.channels.filter((ch) => ch.enabled).map((ch) => K.ch(c.shortName, ch.freqHz)))];
+    out.push({ name: c.shortName, kind: "conventional", status, sites: [], scopes });
   }
   return out;
 }
@@ -235,19 +269,19 @@ export function systemHealth(s: AppState, x: DashSystem, usual: Record<string, U
 /** A site's control channel, judged against its own usual rate. */
 export function siteHealth(s: AppState, site: DashSite, usualRate?: Usual | null): Health {
   const st = site.status;
-  if (!st) return { level: "bad", why: "No control channel open — is one inside a source's band?" };
-  if (st.mismatch) return { level: "bad", why: `The control channel is another system's: ${st.mismatch}` };
+  if (!st) return { level: "bad", why: "No control channel — is one in a source's band?" };
+  if (st.mismatch) return { level: "bad", why: `Another system's control channel: ${st.mismatch}` };
   const locked = val(s, K.cc(site, "locked"));
   const rate = recentAvg(K.cc(site, "good"), 30);
   const bad = recentAvg(K.cc(site, "bad"), 60) ?? 0;
   const good = recentAvg(K.cc(site, "good"), 60) ?? 0;
   const badPct = good + bad > 0 ? (100 * bad) / (good + bad) : 0;
-  if (locked === 0) return { level: "bad", why: "Not decoding its control channel — hunting for another. Check the antenna, the gain, and that the frequency is right." };
+  if (locked === 0) return { level: "bad", why: "Control channel lost, hunting — check antenna, gain, frequency" };
   if (rate === null) return { level: "ok", why: "Starting…" };
   if (usualRate && usualRate.avg > 5 && rate < usualRate.avg * 0.6)
-    return { level: "warn", why: `Decoding ${num(rate)} msg/s, ${Math.round((1 - rate / usualRate.avg) * 100)}% under its usual ${num(usualRate.avg)}. Fewer messages with more lost ones points at reception, not traffic.` };
-  if (badPct > 30) return { level: "bad", why: `${Math.round(badPct)}% of control messages lost — the signal is weak or distorted here.` };
-  if (badPct > 10) return { level: "warn", why: `${Math.round(badPct)}% of control messages lost. A few percent is normal; more suggests multipath or a marginal signal.` };
+    return { level: "warn", why: `${num(rate)} msg/s, ${Math.round((1 - rate / usualRate.avg) * 100)}% under usual (${num(usualRate.avg)}) — reception, if more are lost` };
+  if (badPct > 30) return { level: "bad", why: `${Math.round(badPct)}% control lost — weak or distorted signal` };
+  if (badPct > 10) return { level: "warn", why: `${Math.round(badPct)}% control lost — multipath or marginal signal` };
   return OK(`${num(rate)} msg/s, ${Math.round(100 - badPct)}% decoded`);
 }
 
@@ -270,8 +304,9 @@ export function coverage(s: AppState, hz: number): { src: SourceStatus; depth: n
   return best && { src: best.src, depth: Math.max(0, best.d), beyondHz: best.beyondHz };
 }
 
-/** What a source nothing needs says (SourceStatus.unused). */
-export const UNUSED_SOURCE = "Not needed so far: the other sources reach every channel the config lists, and no call has used this one. You can probably remove it.";
+/** What a source nothing needs says (SourceStatus.unused): its light's word, and the why behind it. */
+export const UNUSED_SOURCE = "Unused — probably removable";
+export const UNUSED_SOURCE_WHY = "The other sources reach every channel the config lists, and no call has used this one. You can probably remove it.";
 
 /** A source: drops, clipping, frequency error, sample rate; nothing wrong but nothing for it to do. */
 export function sourceHealth(s: AppState, src: SourceStatus): Health {
@@ -280,13 +315,13 @@ export function sourceHealth(s: AppState, src: SourceStatus): Health {
   const drops = recentAvg(K.src(src.label, "dropped"), 10) ?? 0;
   const clip = recentAvg(K.src(src.label, "clipPct"), 10) ?? 0;
   const peak = val(s, K.src(src.label, "peak"));
-  if (drops > 0) return { level: "bad", why: "Dropping samples: the computer or USB bus can't keep up. Calls on it lose audio." };
+  if (drops > 0) return { level: "bad", why: "Dropping samples — CPU or USB can't keep up; calls lose audio" };
   if (src.lastError && src.lastErrorS && Date.now() / 1000 - src.lastErrorS < 60) return { level: "bad", why: src.lastError };
-  if (clip > 0.5) return { level: "warn", why: `${num(clip, 1)}% of samples at full scale: the gain is too high (or a strong signal nearby). Lower it a few dB.` };
-  if (peak !== null && peak > -1) return { level: "warn", why: "Peaks reach full scale: little headroom left. Lower the gain a little." };
+  if (clip > 0.5) return { level: "warn", why: `${num(clip, 1)}% clipping — lower the gain a few dB` };
+  if (peak !== null && peak > -1) return { level: "warn", why: "Peaks at full scale — lower the gain a little" };
   if (src.errorPpm != null && !autoTuneOn(src.settings) && Math.abs(src.errorPpm - (src.tunePpm ?? 0)) > 2)
-    return { level: "warn", why: `Its frequency is off by ${num(src.errorPpm, 1)} ppm. Set the source's ppm${src.ppmApply != null ? ` to ${src.ppmApply}` : ""}, or turn on AutoTune.` };
-  if (src.rateMeasured > 0 && Math.abs(src.rateMeasured / src.rateHz - 1) > 0.05) return { level: "warn", why: `Delivering ${num(src.rateMeasured / 1e6, 2)} MS/s of ${num(src.rateHz / 1e6, 2)}.` };
+    return { level: "warn", why: `${signed(src.errorPpm, 1)} ppm off — set ppm${src.ppmApply != null ? ` to ${src.ppmApply}` : ""} or turn on AutoTune` };
+  if (src.rateMeasured > 0 && Math.abs(src.rateMeasured / src.rateHz - 1) > 0.05) return { level: "warn", why: `Delivering ${num(src.rateMeasured / 1e6, 2)} of ${num(src.rateHz / 1e6, 2)} MS/s` };
   return OK(src.unused ? UNUSED_SOURCE : "Clean");
 }
 
@@ -423,12 +458,12 @@ export const OUT_OF_BAND = "outOfBand";
 /** A system's calls lost for want of a recorder or a source, last few minutes: which of the two. */
 export function systemRadioHealth(s: AppState, x: DashSystem): Health {
   if (!running(s)) return { level: "idle", why: "Not recording" };
-  const busy = (recentAvg(K.sys(x.name, "why/no_recorder"), 300) ?? 0) > 0;
-  const outside = (recentAvg(K.sys(x.name, "why/no_source"), 300) ?? 0) > 0;
+  const busy = (recentSum(scoped(x.scopes, "calls/why/noRecorder"), 300) ?? 0) > 0;
+  const outside = (recentSum(scoped(x.scopes, "calls/why/noSource"), 300) ?? 0) > 0;
   const at: Place = ["radio", x.name, OUT_OF_BAND];
-  if (busy && outside) return { level: "warn", why: "Calls are being missed: no free recorder for some, others outside every source's band", at };
-  if (busy) return { level: "warn", why: "Calls are being missed: no free recorder. Add recorders, or a source" };
-  if (outside) return { level: "warn", why: "Calls are being missed: their frequencies are outside every source's band (Out of band)", at };
+  if (busy && outside) return { level: "warn", why: "Missing calls: no free recorder, and outside every source's band", at };
+  if (busy) return { level: "warn", why: "Missing calls: no free recorder — add recorders" };
+  if (outside) return { level: "warn", why: "Missing calls: outside every source's band", at };
   return OK("Recording what it hears");
 }
 

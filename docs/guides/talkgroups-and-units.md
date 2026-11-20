@@ -137,15 +137,15 @@ would refuse the extra columns); **Setup** → **Data** exports it with the talk
   **Ignore** next to the talkgroup; it becomes **Ignored ✕**, click again to record it again. That
   button edits the system's talkgroup file for you: it adds an `Ignore` column if there isn't one
   (and a header row to a file without one), and adds a row for a talkgroup that isn't in the file.
-- **Only the talkgroups in the file.** Turn off **Talkgroups not in the talkgroup file** under
+- **Only the talkgroups in the file.** Turn off **Unlisted talkgroups** under
   **Call rules** on the **Recording** tab (`recordUnknown`, on by default), or for one system under
   **Recording** on its card. This only has an effect once the system has a talkgroup file; with none,
   everything is recorded. A talkgroup that isn't in the file is still recorded while it's patched
   with one that is (a patch's supergroup usually isn't in anyone's file).
 - **Encrypted talkgroups** aren't recorded; see the protocol pages ([P25](p25.md#encrypted-calls)).
 
-The **Radio system** page's **What happened to calls** shows how each call went: **Recorded**,
-**Followed only**, **Ignored**, **Encrypted**, **Not in the file**, **No recorder** or **Out of
+The **Radio system** page's **Call outcomes** shows how each call went: **Recorded**,
+**Followed only**, **Ignored**, **Encrypted**, **Not in file**, **No recorder** or **Out of
 band**.
 
 ## Pasting from RadioReference
@@ -195,23 +195,26 @@ The file has no header. Each line is a unit ID and its name:
 # Fire department radios
 1234,Engine 12
 1235,Truck 4
+0x1C13,Medic 13
 /^7(\d{3})$/,Medic $1
 ```
 
-- A plain number names only that radio.
+- A plain number names only that radio. It's decimal: `1013` is radio 1013.
+- A number after `0x` is hex, as MDC1200 IDs are programmed: `0x1C13` is radio 7187. It's kept as
+  the decimal ID, so **Download** writes `7187,Medic 13`, as Trunk Recorder reads it.
 - A pattern between slashes is a regular expression matched against the unit ID. The name can use
   its groups as `$1` or `\1`: the line above names radio 7042 "Medic 042".
 - The first line that matches wins.
 - Lines starting with `#` are skipped, and so are lines whose pattern isn't a valid regular
-  expression.
+  expression or whose ID after `0x` isn't hex (the card counts them as **unreadable**).
 
 Next to **Load CSV…**, a menu chooses which names come first, between this file and the talker
 aliases radios send (below). It is Trunk Recorder's `unitTagsMode`:
 
 | Menu | `mode` | A radio is named by |
 |---|---|---|
-| **These first, then aliases heard** | `user` (default) | this file; failing that, its talker alias |
-| **Aliases heard first** | `ota` | its talker alias; failing that, this file |
+| **These first, then on-air aliases** | `user` (default) | this file; failing that, its talker alias |
+| **On-air aliases first** | `ota` | its talker alias; failing that, this file |
 | **Only these** | `user_only` | this file only |
 | **No names** | `none` | nothing |
 
@@ -256,8 +259,8 @@ does ignoring a talkgroup from the **Radio system** page.
 **"unknown column" chip.** A header isn't one of the names above (check the spelling). The column
 is kept but not used.
 
-**Talkgroups recorded that you didn't want.** Turn off **Talkgroups not in the talkgroup file**, or
+**Talkgroups recorded that you didn't want.** Turn off **Unlisted talkgroups**, or
 mark them ignored.
 
-**A unit name doesn't apply.** Check that the unit names menu isn't on **Aliases heard first** (an
+**A unit name doesn't apply.** Check that the unit names menu isn't on **On-air aliases first** (an
 alias wins there) or **No names**, and that no earlier line in the file matches the same ID.

@@ -220,7 +220,7 @@ whenever `change` fires.
 |---|---|
 | `connected` | `true` while connected (from `hello` on) |
 | `version` | the recorder's version |
-| `capabilities` | what the recorder can do beyond recording (`hello.capabilities`): `service`, `drivers`, `plugins`, `interfaces`, `host`, `keys`, `calls`, `history` |
+| `capabilities` | what the recorder can do beyond recording (`hello.capabilities`): `service`, `drivers`, `plugins`, `interfaces`, `host`, `keys`, `calls`, `history`, `tuneGain` |
 | `config` | the config (`Config`) |
 | `phase` | `{ phase: "idle" \| "starting" \| "running" \| "stopping", error, ended }` |
 | `status` | `EngineStatus` while running: `nowS`, totals, `systems[]` |
@@ -251,13 +251,14 @@ whenever `change` fires.
 | `send(msg)` | send a command (queued while disconnected) |
 | `start()`, `stop()` | start / stop recording |
 | `listen()`, `listen({ talkgroup })`, `listen({ system, talkgroup })`, `listen(false)` | live audio: every call, one talkgroup's, one system's (by short name) talkgroup's, none. Kept across reconnects. |
+| `listen({ voice: true, audio: false })` | digital calls' [vocoder frames](#vocoder-frames) as `voice` messages, with or without the PCM; mixes with the filters above |
 | `subscribe(topics)` | the costly messages to receive: `["log"]` fills `log`; `"spectrum:0"` a waterfall's `spectrum`. Kept across reconnects. |
 | `setConfig(edit)` | `edit(copy)` changes a copy of the latest config, and the whole config is sent with `configVersion`. If the config changed elsewhere meanwhile it's refused, and `error` says so |
 | `setTalkgroups(shortName, rows)` | replace a system's talkgroups (`Talkgroup` rows; `[]` for none) |
 | `setTalkgroup(shortName, talkgroup, edit)` | change one talkgroup's cells (`{ alphaTag, description, tag, category, ignore }`, any of them) |
 | `setUnitNames(shortName, rows, from?)` | replace a system's own names for its radios (`{ unit, name }` rows; `[]` for none); `from`: where they came from (`{ kind: "file", name: "units.csv" }`) |
 | `setUnitName(shortName, unit, name)` | name one radio (`""`: its own name taken out) |
-| `calls(query)` | recorded calls, newest first (a promise): `query` has any of `system` (short name), `talkgroup`, `unit`, `from` / `to` (start time, Unix ms), `cursor`, `limit` (1 to 500, 100). Answers `{ entries, next?, error? }`; page on with `cursor` while `next` is there. Needs the `calls` capability |
+| `queryCalls(query)` | recorded calls, newest first (a promise): `query` has any of `system` (short name), `talkgroup`, `unit`, `from` / `to` (start time, Unix ms), `cursor`, `limit` (1 to 500, 100). Answers `{ entries, next?, error? }`; page on with `cursor` while `next` is there. Needs the `calls` capability |
 | `callUrl(entry, "wav" \| "json" \| "m4a")` | a recorded call's file URL |
 | `talkgroups(shortName)` | the system's talkgroups, from `talkgroupRows` and the edits since: `Map` talkgroup → `{ talkgroup, alphaTag, description, tag, group, mode }`; a conventional system's channels (`alphaTag` the channel's name) |
 | `unitName(shortName, unit)` | a radio's name, as the system's `unitNames.mode` says: its unit names (`unitNameRows`, regular-expression rows too) and the alias heard; else `""` |
@@ -508,6 +509,7 @@ Every message is a JSON object with a `type`. Exact fields are in
 | `concluded` | A call was recorded | `entry`: `{ path, record, audio, json }`; `audio` / `json`: whether they stay in the recordings folder once the plugins are done (`audio`: some audio, .wav or .m4a, stays: **Keep .wav** / **Keep .m4a**; `json`: **Keep call JSON**; false: deleted then) |
 | `callFiles` | A call's upload plugins are done, and it kept other than its entry said (an upload failed and its files stay) | `path`, `audio`, `json` |
 | `log` | Topic `log` (warnings and errors always) | `lines[]`: `{ timeS, kind, text, system?, site?, time?, level? }` — `kind` e.g. `"error"`, `"control"`, `"alias"`, `"plugin"`, `"info"`, or a control-message kind; the decoder's lines have `timeS` (seconds into the recording), the recorder's own `time` (Unix seconds) and `level` |
+| `voice` | Live voice, while listening with `voice` | `chunk`: the `voice` plugin topic's chunk ([Vocoder frames](#vocoder-frames)) |
 | `unitAlias` | A talker alias was heard | `system` (short name), `unit`, `alias` |
 | `heard` | On connecting; conventional codes heard changed | `heard`: frequency (Hz, as a string) → `HeardCode[]` |
 | `config` | On connecting; the config changed (anyone's `setConfig`, a plugin added…) | `config`, `version` (what an edit is sent with) |
@@ -519,6 +521,7 @@ Every message is a JSON object with a `type`. Exact fields are in
 | `survey` | The survey's progress | `stage` (`idle` / `scanning` / `monitoring` / `done`), candidates, the channel monitored, the suggested system |
 | `licenseResult` | Answers `licenseQuery`, to its sender | `id`, `results[]` of `{ freqHz, historical, licenses[] }` (each license: `callSign`, `licensee`, `serviceCode`, `serviceDesc`, `freqHz`, `emission`, `distanceM`, `bearingDeg`, `bearingCardinal`, `city`, `state`, `status`, `locationKind`; `historical`: none active, so lapsed ones), or `error` |
 | `surveySpectrum` | While surveying | like `spectrum` |
+| `tune` | A radio's gain being tuned, each time it moves; on connecting, the last (control access); answers `tuneGain` with `check` | `phase` (`planned` / `running` / `done` / `stopped` / `failed`), `source`, `radio`, `plan` (its steps, in words), `scored`, `watched`, `start`, `tried[]` (each `candidate`, `against`, `cmp` `{ diff, se }` or `why` it was refused, `kept`, `systems[]` figures, `clipPct`), `now`, `estimateS`, `elapsedS`, `best`, `applied`, `error`. A gain setting is `[knob, value][]`: `lna`, `mixer`, `vga`, `amp`, `step` (an Airspy table's), `gain` (dB) |
 | `sourceProfile` | Answers `profileSource` | `source`, then `error`, or `centerHz`, `rateHz`, `spectrum` / `floor` (1024 points, dB, −rate/2 … +rate/2), `rows` (a waterfall), `referenceDb`, `lowHz` / `highHz` (how far in the floor is 3 dB down), `lowDropDb` / `highDropDb`, `suggestedGuardHz` |
 | `pluginRuntime` | A plugin's totals changed (control access) | `id`, `runtime` (state, counts, recent log; `metrics` — queue, upload time, endpoints — when the plugin reports them; restarts, events dropped, uptime; results per minute for the last hour) |
 | `interfaces` | On connecting (control access);  after interface changes; answers `interfaces` | `interfaces` (`InterfaceInfo[]`: each one's port, access, whether it's served and why not), `api` |
@@ -539,7 +542,7 @@ too.
 |---|---|---|
 | `start` | — | Start recording with the saved config. `state` follows; `error` if it can't. |
 | `stop` | — | Stop recording. Calls in progress are saved. |
-| `listen` | `on`, `system` (a short name, or null), `talkgroup` (number or null) | Live audio on this connection: every call (both null), one system's, one talkgroup's, or both. `on: false` stops it. |
+| `listen` | `on`, `system` (a short name, or null), `talkgroup` (number or null), `voice` (optional, false), `audio` (optional, true) | Live audio on this connection: every call (both null), one system's, one talkgroup's, or both. `voice: true` adds digital calls' [vocoder frames](#vocoder-frames); `audio: false` leaves out the PCM. `on: false` stops it. |
 | `setConfig` | `config`, `version` | Replace the whole config, edited from `version` (the last `config` message's): saved, and sent to everyone as `config`. Refused if the config has changed since (another browser saved). Always answered with `configSaved`. Takes effect at the next `start` (plugin settings at once). |
 | `setTalkgroups` | `system` (short name), `talkgroups`: rows as the `talkgroups` message has them; `from` (optional): where they came from, an origin without `at` (`{ kind: "file", name: "dc.csv" }`) | Replace all of a system's talkgroups (`[]` removes them; a number twice: the later row, in the first's place). A row whose names were already there keeps its origin; the others get `from`, at the recorder's time (no `from`: each keeps the `origin` it's sent with). Everyone gets them as `talkgroups`; a recording takes them at once. CSV is only for files: read a talkgroup file yourself and send its rows. |
 | `setUnitNames` | `system`, `unitNames`: rows as the `unitNames` message has them; `from` (optional) | Replace all of a system's own names for its radios, as `setTalkgroups` (a unit twice: the later row, in the first's place). Everyone gets them as `unitNames`; a recording names its calls' talkers by them at once. |
@@ -553,6 +556,8 @@ too.
 | `surveyStart` | `source`, `bands` (ids from `hello.surveyBands`), `findGain` | Scan for systems with radio `source` (not while recording). |
 | `surveyListen` | `freqHz` | Monitor this signal. |
 | `surveyRescan` / `surveyStop` | — | Scan again / end the survey. |
+| `tuneGain` | `source`, and optionally `systems[]`, `protect`, `sliceS`, `settleS`, `rounds`, `maxSteps`, `margin`, `mode`, `try` (a gain setting), `apply`, `check` | While recording: tune radio `source`'s gain by what its systems decode, following the plan for its kind (→ `tune` as it goes). Each candidate goes on the radio as a trial, never saved; at the end it goes back, or `apply` saves the best. `check`: only the plan (→ `tune`, phase `planned`), nothing changed. One at a time; stopping recording, or editing that radio, stops it. See [`trunk-pro tune`](../command-line.md#tune). |
+| `tuneStop` | — | Stop tuning: the radio goes back as it was. |
 | `licenseQuery` | `id`, `lat`, `lon`, `radiusM`, `signals[]` of `{ freqHz, widthHz? }` | Who is licensed on these frequencies within `radiusM` (at most 150 km) of the location (→ `licenseResult`). The recorder sends the frequencies and the location to trunkrecorder.pro (`server.trpApi`); only when the user asks. |
 | `callSignQuery` | `id`, `callSigns[]` | Who holds these call signs (heard on the air), from trunkrecorder.pro, no location (→ `callSignResult`: `id`, `results[]` of `{ callSign, licensee, serviceCode, serviceDesc, status, city, state }` for each active one, or `error`). |
 | `profileSource` | `source`, `centerHz` | Look at radio `source`'s band for a couple of seconds, tuned to `centerHz` (a capture keeps its own), and measure how it rolls off at the edges (→ `sourceProfile`; not while recording). |
@@ -611,6 +616,28 @@ simplest version by hand.
 Browsers only start audio after a click or key press: create or `resume()`
 the `AudioContext` in a click handler. Listening is per connection and off
 after a reconnect, so send `listen` again after `hello`.
+
+### Vocoder frames
+
+With `"voice": true` in `listen`, digital calls (P25, DMR, NXDN, ProVoice)
+also come as the vocoder frames their audio was made from, in a `voice`
+message just before each audio chunk: `chunk` is the `voice` plugin topic's
+chunk, as plugins get it. Add `"audio": false` for the frames alone. Analog
+calls have none.
+
+```json
+{"type":"voice","chunk":{"call_id":42,"system":0,"short_name":"dcfd","talkgroup":101,"unit":1234,"unit_name":"E1","decrypted":false,
+ "frames":[{"codec":"imbe","bits":"a1b2c3d4e5f60718293a4b","e0":0,"errs":2,"erased":false,"kind":"voice"}]}}
+```
+
+Each frame (`VoiceFrame`, a line of a call's `.frames.jsonl` too) is 20 ms:
+`codec` (`imbe`: P25 Phase 1, ProVoice, 88 bits; `ambe`: AMBE+2 half rate,
+P25 Phase 2, DMR, NXDN, 49 bits), its information `bits` after FEC as hex
+(MSB first, the last byte zero-padded), the bit errors corrected (`errs`,
+and IMBE's `e0`), `erased` when it was lost, what the vocoder made of it
+(`kind`: `voice`, `repeat`, `muted`, `erasure`, `tone`) and an AMBE+2 frame's
+`tone`. The talker is on each chunk, so a change of talker shows as the
+next chunk's `unit`.
 
 ## Recorded calls
 

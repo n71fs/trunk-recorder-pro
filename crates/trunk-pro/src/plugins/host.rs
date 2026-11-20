@@ -295,7 +295,9 @@ impl PluginHost {
             topics.call_updates |= m.subscribes(topic::CALL_UPDATE);
             topics.units |= m.subscribes(topic::UNIT);
             topics.status |= m.subscribes(topic::STATUS);
+            topics.totals |= m.subscribes(topic::TOTALS);
             topics.tone_patterns |= m.subscribes(topic::TONE_PATTERN);
+            topics.voice |= m.subscribes(topic::VOICE);
             live |= topic::ALL.iter().any(|&t| topic::is_live(t) && m.subscribes(t));
             let data_dir = s.data_dir.clone().unwrap_or_else(|| super::data_dir(&s.id));
             let _ = std::fs::create_dir_all(&data_dir);
@@ -404,6 +406,7 @@ impl PluginHost {
             HostMessage::TonePattern(t) => (topic::TONE_PATTERN, About { decrypted: t.decrypted, ..on(&t.short_name, Some(t.talkgroup)) }),
             // (No one system's: never delayed.)
             HostMessage::Status(_) => (topic::STATUS, About::default()),
+            HostMessage::Totals(_) => (topic::TOTALS, About::default()),
             // (Live media and concluded calls may be decrypted ones: they go only by `live` and
             // `concluded`, which know.)
             _ => return,
@@ -452,9 +455,9 @@ impl PluginHost {
     }
 
     /// A call's live audio, to the plugins that take it: its PCM as an `audio` chunk, its vocoder frames
-    /// as a `voice` one (`unit_name`: the talker's, "": none). One decrypted with our keys goes only to
-    /// plugins with `shareDecrypted`.
-    pub fn live(&self, short_name: &str, unit_name: &str, a: &LiveAudio) {
+    /// (`voice`, built as [`PluginTopics::voice`] asks) as a `voice` one. One decrypted with our keys
+    /// goes only to plugins with `shareDecrypted`.
+    pub fn live(&self, short_name: &str, a: &LiveAudio, voice: Option<&VoiceChunk>) {
         if !self.live {
             return;
         }
@@ -464,9 +467,8 @@ impl PluginHost {
             let chunk = AudioChunk { call_id: a.call_id, system: a.system, short_name: short_name.to_string(), talkgroup: a.talkgroup, sample_rate: 8000, pcm };
             self.shared.dispatch(topic::AUDIO, &line(&HostMessage::Audio(chunk)), &about, None, None);
         }
-        if !a.frames.is_empty() && self.shared.wants(topic::VOICE) {
-            let chunk = VoiceChunk { call_id: a.call_id, system: a.system, short_name: short_name.to_string(), talkgroup: a.talkgroup, unit: a.unit, unit_name: unit_name.to_string(), decrypted: a.decrypted, frames: a.frames.clone() };
-            self.shared.dispatch(topic::VOICE, &line(&HostMessage::Voice(chunk)), &about, None, None);
+        if let Some(chunk) = voice.filter(|_| self.topics.voice) {
+            self.shared.dispatch(topic::VOICE, &line(&HostMessage::Voice(chunk.clone())), &about, None, None);
         }
     }
 
@@ -1164,7 +1166,8 @@ mod tests {
         call("dcfd/held", 5);
         call("dcfd/now", 6);
         let frame = trunk_core::trunk::frames::VoiceFrame { codec: trunk_recorder_plugin::Codec::Imbe, bits: vec![0; 88], e0: 0, errs: 0, erased: false, kind: trunk_recorder_plugin::FrameKind::Voice, tone: None };
-        host.live("dcfd", "", &LiveAudio { call_id: 1, system: 0, talkgroup: 5, unit: 0, samples: vec![0.0; 160], frames: vec![frame], decrypted: false });
+        let audio = LiveAudio { call_id: 1, system: 0, talkgroup: 5, unit: 0, samples: vec![0.0; 160], frames: vec![frame], decrypted: false };
+        host.live("dcfd", &audio, trunk_app::session::voice_chunk("dcfd", "", &audio).as_ref());
         let got = dir.join("data/got.jsonl");
         let lines = || std::fs::read_to_string(&got).unwrap_or_default();
         let t0 = Instant::now();

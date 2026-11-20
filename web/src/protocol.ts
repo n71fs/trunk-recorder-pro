@@ -141,7 +141,7 @@ export interface Radios {
  */
 export interface Channel {
   freqHz: number;
-  mode: "fm" | "am" | "p25" | "dmr" | "nxdn48" | "nxdn96";
+  mode: "fm" | "am" | "p25" | "dmr" | "nxdn48" | "nxdn96" | "auto";
   name: string;
   talkgroup?: number;
   /** The code it records: FM's CTCSS tone or DCS code ("151.4", "D023N"), P25's NAC ("293"), DMR's colour code ("1"), NXDN's RAN ("5"); absent / "": any. */
@@ -202,6 +202,8 @@ export interface ShareStatus {
  * A site's identity (NAC, WACN, System ID are hex on the air): what a site in
  * the config expects (absent: any), and what a control channel said of itself
  * in status and the survey (absent: not heard yet). Compare with `!= null`.
+ * P25 states nac…site; SmartNet sysId, site; DMR colorCode (Tier III also
+ * network, site, as sent); NXDN ran (Type-C also sysId, its system, and site).
  */
 export interface SiteIdentity {
   nac?: number | null;
@@ -209,6 +211,9 @@ export interface SiteIdentity {
   sysId?: number | null;
   rfss?: number | null;
   site?: number | null;
+  colorCode?: number | null;
+  network?: number | null;
+  ran?: number | null;
 }
 
 /** A SmartNet band plan the survey learned, in Trunk Recorder's names (Hz; offset a channel number). */
@@ -326,10 +331,6 @@ export interface Site {
   lcnTableHz?: Record<string, number>;
   /** DMR: voice frequencies to watch besides the control channels (Trunk Recorder's channels). */
   dmrChannelsHz?: number[];
-  /** DMR per-frequency color code filters (integer Hz keys, codes 0–15). */
-  dmrColorCodes?: Record<string, number>;
-  /** XPT programmed home talkgroup → repeater (1–8). */
-  xptHomeGroups?: Record<string, number>;
   /** DMR: only this colour code. */
   colorCode?: number;
   /** NXDN: the control channel's (Type-D: the repeaters') rate; default "nxdn48". */
@@ -603,6 +604,8 @@ export interface MonitorSettings {
   timeServer: string;
   /** The clock off by this much or more, ms: a warning, and calls marked clock_off (a problem at 5 s, or 4 times this). */
   clockWarnMs: number;
+  /** Ask GitHub once a day for the app's latest release: the dashboard says when there's a newer one (default true). Applies at once. */
+  checkUpdates: boolean;
 }
 
 /**
@@ -742,6 +745,8 @@ export interface SiteStatus {
   name: string;
   nowS: number;
   controlChannelHz: number | null;
+  /** The source (its index) its control channel is received on; null while none is open. */
+  source: number | null;
   identity: SiteIdentity;
   good: number;
   bad: number;
@@ -783,33 +788,14 @@ export interface SiteDetail {
   nxdn: NxdnSiteStatus | null;
 }
 
-/** XPT observations are site-local; target hints/hashes are not full radio IDs. */
-export type XptControl =
-  | { Status: { sequence: number; free: number; slots: XptOccupancy[] } }
-  | { Adjacent: { sequence: number; sites: XptNeighbor[] } }
-  | { Short: { free: number; priority: number; target_hash: number } }
-  | { Setup: { repeater: number; slot: number; group: boolean; target: number; source: number; free: number; handshake: number; reserved: number } };
-export interface XptOccupancy { status: number; target_hint: number }
-export interface XptNeighbor { site: number; free: number; reserved: number }
-export interface XptTimed<T> { value: T; heard_s: number }
-export interface XptStatus {
-  home_groups: Record<string, number>;
-  free: XptTimed<number> | null;
-  priority: XptTimed<[number, number]> | null;
-  occupancy: Record<string, XptTimed<XptOccupancy>>;
-  neighbors: Record<string, XptTimed<XptNeighbor>>;
-  setups: XptTimed<XptControl>[];
-  calls: { freq_hz: number; repeater: number | null; slot: number; target: number; source: number; group: boolean; encrypted: boolean; late_entry: boolean; heard_s: number }[];
-}
-
 export interface DmrSiteStatus {
-  /** XPT signaling and confirmed voice calls; null until identified. */
-  xpt?: XptStatus | null;
-  /** Repeaters with at least one fresh explicitly idle slot. */
-  availableRepeaters?: number[] | null;
   /** "DMR Capacity Plus" | "DMR Capacity Max" | "DMR Connect Plus" | "DMR Tier III" | "Hytera XPT" | null (not known yet). */
   variant: string | null;
   colorCode: number | null;
+  /** Tier III / Capacity Max: the System Identity Code its control channel sends, its model (how
+   *  it splits into the network and site the site's `identity` carries) and which category of
+   *  radio may use the site. */
+  sysCode: { code: number; model: "Tiny" | "Small" | "Large" | "Huge"; category: "reserved" | "A" | "B" | "A+B" } | null;
   /** Capacity Plus: the rest channel's logical slot number, and its frequency once known. */
   rest: { lsn: number; freqHz: number | null } | null;
   /** Keyed CRCs (restricted access). */
@@ -862,6 +848,8 @@ export interface SourceStatus {
   centerHz: number;
   rateHz: number;
   rateMeasured: number;
+  /** The gain its radio is set to, when that isn't the gain asked for (the radio's nearest step, or within its range here). */
+  gainSet?: string | null;
   dropped: number;
   errors: number;
   /** The last error, for 5 minutes after it. */
@@ -932,6 +920,39 @@ export interface LogLine {
   /** The system's short name, for its messages, and the site's name. */
   system?: string;
   site?: string;
+}
+
+/** One vocoder frame (20 ms) as the recorder decoded it: the `voice` plugin topic's, and a line of a call's `.frames.jsonl`. */
+export interface VoiceFrame {
+  /** "imbe": P25 Phase 1, ProVoice (88 bits); "ambe": AMBE+2 half rate, P25 Phase 2, DMR, NXDN (49 bits). */
+  codec: "imbe" | "ambe";
+  /** Information bits after FEC, as hex: MSB first, the last byte zero-padded. */
+  bits: string;
+  /** IMBE: bit errors corrected in u0. AMBE: 0. */
+  e0: number;
+  /** Bit errors the FEC corrected in the whole frame. */
+  errs: number;
+  /** Known lost: `errs` is then meaningless. */
+  erased: boolean;
+  /** What the vocoder made of it. */
+  kind: "voice" | "repeat" | "muted" | "erasure" | "tone";
+  /** AMBE+2: the tone played for it, [ID, level]. */
+  tone?: [number, number];
+}
+
+/** A digital call's live voice as vocoder frames: the `voice` plugin topic's chunk, as it is. */
+export interface VoiceChunk {
+  call_id: number;
+  /** Its system's number this run; `short_name` is its identity. */
+  system: number;
+  short_name: string;
+  talkgroup: number;
+  /** Who is talking (0: not known yet), and their name. */
+  unit: number;
+  unit_name?: string;
+  /** Of a call decrypted with the recorder's keys. */
+  decrypted: boolean;
+  frames: VoiceFrame[];
 }
 
 /** Trunk Recorder's call JSON: each call's .json file, and `record` in `concluded` and `hello.history`. */
@@ -1039,6 +1060,9 @@ export interface CallEntry {
   audio?: boolean;
   json?: boolean;
 }
+
+/** A recorded call's system: its record's short_name, else its folder. */
+export const systemOf = (c: CallEntry) => c.record.short_name || c.path.split("/")[0] || "";
 
 export interface Spectrum {
   source: number;
@@ -1511,9 +1535,11 @@ export interface DirListing {
 // Series are named by `/`-separated keys (crates/trunk-app/src/stats):
 //   src/<label>/{noise,peak,clipPct,samples,dropped,errors,ppm,tune}
 //   sys/<shortName>/{active,recording,calls,airMs,audioBytes,notSaved,dup}
-//   sys/<shortName>/cc/{good,bad,locked,syncs,nidFails,flywheels,eqResets,frames,sep,offset,signal,noise,snr,inSync,deviation}
-//   sys/<shortName>/why/<recorded|monitored|ignored|encrypted|unknown_tg|no_source|no_recorder>
-//   sys/<shortName>/voice/{frames,errors,bad}
+//   <site>/cc/{good,bad,locked,syncs,nidFails,flywheels,eqResets,frames,sep,offset,signal,noise,snr,inSync,deviation,airSym,syncLossSym,phaseErr}
+//   <site>, <channel>: calls/{started,recorded,skipped}  calls/why/<ignored|unknownTg|encrypted|noSource|noRecorder|noFrequency>
+//                      voice/<imbe|ambe>/{frames,bad,errors}   (each copy of a call, where it was heard)
+//   <channel>/{open,signal,closed,noise,snr}
+//     <site> = sys/<shortName>, or sys/<shortName>/site/<site> (several sites); <channel> = sys/<shortName>/ch/<Hz>
 //   all/{calls,airMs,audioBytes}  day/{calls,airS,audioBytes}  eng/{load,recording,channels,recorders}
 //   plat/{cpu,proCpu,proCores,proMem,mem,memAvail,swap,memPsi,memLevel,load1,temp,throttledUs,piThrottled}
 //   plat/disk/<recordings|data>/{free,freePct}  net/{rx,tx,errors,up,rtt,dns}
@@ -1645,6 +1671,8 @@ export interface PlatformInfo {
   disks: { name: string; path: string; mount: string; totalBytes: number; freeBytes: number; kind?: string; overflowed?: number; removed?: number; missing?: boolean }[];
   /** macOS: whether Spotlight indexes the recordings folder (null: not checked yet, or not macOS). */
   spotlight?: { path: string; state: "indexed" | "excluded" | "unknown"; why: string } | null;
+  /** A newer release on GitHub than the one running (checked once a day); null when up to date, not checked yet, or `monitor.checkUpdates` is off. */
+  update?: { version: string; url: string } | null;
   probes: ProbeRow[];
   clock: ClockInfo;
   /** With the `platform` topic: each core's use, %, and the interfaces' traffic since the last sample. */
@@ -1901,8 +1929,83 @@ export interface RadioResultBody {
  * - `host`: the computer's and plugins' figures (`host`)
  * - `keys`: key containers opened with a password
  * - `calls`: the call store (`callsQuery`); the desktop app has it while its call store is open
+ * - `tuneGain`: tuning a radio's gain while recording (`tuneGain`, `tune`)
  */
-export type Capability = "service" | "drivers" | "plugins" | "interfaces" | "host" | "keys" | "calls" | "history";
+export type Capability = "service" | "drivers" | "plugins" | "interfaces" | "host" | "keys" | "calls" | "history" | "tuneGain";
+
+/** A gain as set: each knob (`lna`, `mixer`, `vga`, `amp`, `pga`; `step`: an Airspy table's; `gain`: the overall dB) and its value. */
+export type GainSetting = [string, number][];
+
+/** How a candidate gain compared with the one it would replace, over the rounds: `diff` (candidate less incumbent, 0–100 points) and its standard error `se`. */
+export interface GainCmp {
+  diff: number;
+  se: number;
+  incumbent: number;
+  candidate: number;
+}
+
+/** One system's figures in a comparison: [incumbent, candidate]. */
+export interface TuneSystemFigures {
+  system: string;
+  /** Scored, not only watched. */
+  scored: boolean;
+  controlPct: [number, number];
+  voiceLostPct?: [number, number];
+  phaseErr?: [number, number];
+  snrDb?: [number, number];
+}
+
+export interface TuneTry {
+  candidate: GainSetting;
+  against: GainSetting;
+  /** None: refused (`why`). */
+  cmp?: GainCmp;
+  kept: boolean;
+  why?: string;
+  systems: TuneSystemFigures[];
+  clipPct: number;
+  /** The best against where it started. */
+  finalCheck?: boolean;
+}
+
+/** A radio's gain being tuned (`tuneGain`), each time it moves. `planned`: what it would do (`check`), nothing changed. */
+export interface TuneReport {
+  phase: "planned" | "running" | "done" | "stopped" | "failed";
+  source: number;
+  radio: string;
+  /** The plan for the radio's kind, a line a step: which stage moves first, which way, in what steps. */
+  plan: string[];
+  scored: string[];
+  watched: string[];
+  start: GainSetting;
+  tried: TuneTry[];
+  now?: GainSetting;
+  estimateS: number;
+  elapsedS: number;
+  best?: GainSetting;
+  applied: boolean;
+  error?: string;
+}
+
+/** `tuneGain`: tune source `source`'s gain by what its systems decode, while recording. Each candidate goes on the air as a trial, not saved; at the end the radio goes back, or `apply` saves the best. */
+export interface TuneRequest {
+  source: number;
+  /** Score only these systems (short names); the radio's others are watched and guarded by `protect` (points). */
+  systems?: string[];
+  protect?: number | null;
+  sliceS?: number;
+  settleS?: number;
+  rounds?: number;
+  maxSteps?: number;
+  margin?: number;
+  /** An Airspy's or HydraSDR's: search this gain mode instead. */
+  mode?: "linearity" | "sensitivity" | "manual" | null;
+  /** Compare this one setting with the radio's, and nothing else. */
+  try?: GainSetting | null;
+  apply?: boolean;
+  /** Only say what it would do: answered with a `tune` of phase `planned`. */
+  check?: boolean;
+}
 
 /**
  * A system's talkgroup: one row of its talkgroup file (Trunk Recorder's
@@ -2088,6 +2191,8 @@ export type FromRecorder =
   | { type: "history"; entries: CallEntry[]; next?: string }
   /** A system's talker aliases as saved (Trunk Recorder's unitTagsOTA CSV): one for each system with some, on connecting (then `unitAlias` for each new one). */
   | { type: "units"; system: string; csv: string }
+  /** A system's radios whose IDs came in MDC1200 (the radio registry's): one for each system with some, on connecting (then each call's `srcList` says it). */
+  | { type: "mdcUnits"; system: string; units: number[] }
   /** Which key containers are unlocked, after an unlock, a lock or a config change. */
   | { type: "keys"; sources: LockableKeys[] }
   | { type: "radios"; radios: Radios }
@@ -2105,6 +2210,8 @@ export type FromRecorder =
   /** Radio `unit` of system `system` named `name` (setUnitName; "": its own name taken out): make the same edit, by `origin` (units.ts withUnitName). */
   | { type: "unitNameEdited"; system: string; unit: number; name: string; origin: Origin }
   | { type: "status"; status: EngineStatus; sources: SourceStatus[]; load: number; calls: CallView[] }
+  /** Live voice as vocoder frames, beside its live audio: only while listening with `voice`. */
+  | { type: "voice"; chunk: VoiceChunk }
   | ({ type: "spectrum" } & Spectrum)
   | { type: "log"; lines: LogLine[] }
   | { type: "concluded"; entry: CallEntry }
@@ -2115,6 +2222,8 @@ export type FromRecorder =
   | { type: "heard"; heard: Record<string, HeardCode[]> }
   | ({ type: "survey" } & SurveyState)
   | ({ type: "surveySpectrum" } & Spectrum)
+  /** A radio's gain being tuned, to control connections; on connecting, the last. */
+  | ({ type: "tune" } & TuneReport)
   /** Answers licenseQuery: the licenses found on each frequency, or why there are none. */
   | { type: "licenseResult"; id: number; results: LicenseResultRow[]; error: string | null }
   /** Answers callSignQuery: each active call sign's holder (unknown or lapsed ones left out), or why there are none. */
@@ -2189,8 +2298,9 @@ export type ToRecorder =
   | { type: "listDir"; path: string }
   /** A Trunk Recorder config.json (or a folder with one), with the files it names. */
   | { type: "readTrConfig"; path: string }
-  /** Live audio: on/off, optionally one system's (its short name) and/or one talkgroup's. */
-  | { type: "listen"; on: boolean; system: string | null; talkgroup: number | null }
+  /** Live audio: on/off, optionally one system's (its short name) and/or one talkgroup's.
+   * `voice`: also digital calls' vocoder frames (`voice` messages); `audio: false`: those alone, without the PCM (default true). */
+  | { type: "listen"; on: boolean; system: string | null; talkgroup: number | null; voice?: boolean; audio?: boolean }
   /** Open a key container (a key source with no password file) with its password; held in memory only. */
   | { type: "unlockKeys"; source: string; password: string }
   /** Forget a key container's keys: its systems stop decrypting at once. */
@@ -2203,6 +2313,9 @@ export type ToRecorder =
   | { type: "surveyListen"; freqHz: number }
   | { type: "surveyRescan" }
   | { type: "surveyStop" }
+  | ({ type: "tuneGain" } & TuneRequest)
+  /** Stop tuning: the radio goes back as it was. */
+  | { type: "tuneStop" }
   /** Who is licensed on these frequencies within `radiusM` of (lat, lon): sent to trunkrecorder.pro; answered with licenseResult. */
   /** Who holds these call signs (heard on the air): sent to trunkrecorder.pro, no location; answered with callSignResult. */
   | { type: "callSignQuery"; id: number; callSigns: string[] }

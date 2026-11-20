@@ -4,7 +4,8 @@
 //! wall clock (`now_ms`), the local date for folder names, and does the I/O.
 
 use serde_json::{json, Value};
-use trunk_core::trunk::{heard_code, Call, Engine, Event, IdField, Identity, LiveAudio, MessageType, NoteLevel, ProtocolStatus};
+use trunk_core::metrics;
+use trunk_core::trunk::{heard_code, Call, ChannelKind, Engine, Event, Identity, LiveAudio, MessageType, NoteLevel, ProtocolStatus};
 
 use crate::filename;
 use sdr_core::clock::{ClockEvent, SampleClock};
@@ -28,10 +29,11 @@ pub enum Output {
     Message(ToClient),
     /// Live audio of a call of `audio.system` — that system's number for this
     /// run (from 0, trunked then conventional: `status.systemNames`) — whose
-    /// short name, its identity, is `short_name`; `unit_name`: the talker's
-    /// ("": none). (A call heard on several sites of a system plays from one
-    /// of them at a time.)
-    Audio { short_name: String, unit_name: String, audio: LiveAudio },
+    /// short name, its identity, is `short_name`. (A call heard on several
+    /// sites of a system plays from one of them at a time.) `voice`: its
+    /// vocoder frames ([`voice_chunk`]) while plugins take topic `voice` or
+    /// interfaces listen with it (`voice_listened`); none for analog.
+    Audio { short_name: String, audio: LiveAudio, voice: Option<trunk_recorder_plugin::VoiceChunk>, voice_listened: bool },
     /// A concluded call to store at `<rel>.wav` / `<rel>.json` (relative to
     /// the recordings folder); `record` is its call JSON, and [`call_entry`]
     /// its history entry, which the platform sends as a `concluded` message
@@ -66,6 +68,8 @@ pub enum Output {
 const STATUS_EVERY_S: f64 = 200.0;
 /// The control channel decode rate is checked over this long, s.
 const RATE_EVERY_S: f64 = 10.0;
+/// Every series' running totals go to plugins this often, ms.
+const TOTALS_EVERY_MS: f64 = 10_000.0;
 /// A running source that sends nothing for this long is fed silence in its
 /// place ([`Engine::push_gap`]), so time goes on: calls on it end, and its
 /// clock stays in step with the others'. ms of wall clock.
@@ -90,7 +94,10 @@ pub struct PluginTopics {
     pub call_updates: bool,
     pub units: bool,
     pub status: bool,
+    /// Every series' running totals ([`trunk_recorder_plugin::Totals`]).
+    pub totals: bool,
     pub tone_patterns: bool,
+    pub voice: bool,
 }
 
 /// Live audio as the browsers take it, a binary frame: `[2][u16 system][u32 call][u32 tg][i16…]`.
@@ -104,6 +111,22 @@ pub fn audio_frame(a: &LiveAudio) -> Vec<u8> {
     frame
 }
 
+/// Live voice as the vocoder frames its audio was made from (`unit_name`: the
+/// talker's, "": none): what the `voice` plugin topic and interfaces listening
+/// with `voice` are sent ([`Output::Audio`]). None: analog, no frames.
+pub fn voice_chunk(short_name: &str, unit_name: &str, a: &LiveAudio) -> Option<trunk_recorder_plugin::VoiceChunk> {
+    (!a.frames.is_empty()).then(|| trunk_recorder_plugin::VoiceChunk {
+        call_id: a.call_id,
+        system: a.system,
+        short_name: short_name.to_string(),
+        talkgroup: a.talkgroup,
+        unit: a.unit,
+        unit_name: unit_name.to_string(),
+        decrypted: a.decrypted,
+        frames: a.frames.clone(),
+    })
+}
+
 /// Local time's offset from UTC at a Unix time, s (east positive) — Trunk
 /// Recorder's folders are in local time, which only the platform knows.
 pub type LocalOffset = fn(i64) -> i32;
@@ -115,6 +138,8 @@ pub struct SourceCounts {
     pub dropped: u64,
     pub errors: u64,
     pub rate_measured: f64,
+    /// The gain its radio is set to, when that isn't the gain asked for ([`Session::source_gain`]).
+    pub gain_set: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -126,6 +151,7 @@ struct SourceStats {
     /// When it came, Unix s (the error is shown for [`ERROR_SHOWN_S`]).
     last_error_s: f64,
     rate_measured: f64,
+    gain_set: Option<String>,
     /// The newest buffer's arrival (ms) and the samples to its end; and the
     /// same where the rate's window began ([`RATE_WINDOW_MS`]).
     arrived: Option<(f64, u64)>,
@@ -358,6 +384,9 @@ pub struct Session {
     /// Each system's recording rules, as calls number them ([`Config::recordings`]).
     recordings: Vec<crate::config::Recording>,
     pub plugin_topics: PluginTopics,
+    /// How the computer's clock is kept ([`trunk_recorder_plugin::ClockState::sync`]), as the
+    /// app last saw; none: the operating system doesn't say.
+    pub clock_sync: Option<String>,
     /// Wall clock (Unix ms) at the engine's time 0, as at Start: the clock
     /// sources are measured against. What times are given out by is the
     /// engine's ([`Session::correct_wall_clock`]).
@@ -366,6 +395,7 @@ pub struct Session {
     wall_correction_ms: f64,
     last_plugin_status_ms: f64,
     plugin_good: Vec<u64>,
+    last_plugin_totals_ms: f64,
     /// The codes conventional frequencies carried ([`crate::heard`]).
     heard: HeardCodes,
     /// AutoTune scores by source label, as loaded and as last given to save.
@@ -435,10 +465,12 @@ impl Session {
             sites,
             recordings,
             plugin_topics: PluginTopics::default(),
+            clock_sync: None,
             epoch_ms,
             wall_correction_ms: 0.0,
             last_plugin_status_ms: 0.0,
             plugin_good: Vec::new(),
+            last_plugin_totals_ms: 0.0,
             heard: HeardCodes::default(),
             tune: Default::default(),
             tune_saved: String::new(),
@@ -490,6 +522,11 @@ impl Session {
     }
 
     /// The system named `short_name`'s own names for its radios are now `rows`: calls from now on are named by them.
+    /// The sites running, each with the source its control channel is on.
+    pub fn sites(&self) -> Vec<trunk_core::trunk::SiteStatus> {
+        self.engine.status().sites
+    }
+
     pub fn set_unit_names(&mut self, short_name: &str, rows: &[trunk_core::trunk::UnitNameRow]) -> bool {
         let set = self.engine.set_unit_names(short_name, rows);
         self.meas.shared().names.lock().unwrap().set_systems(&self.engine.systems());
@@ -607,6 +644,19 @@ impl Session {
         self.records.push(Record::text(Level::Error, None, text));
     }
 
+    /// The gain source `source`'s radio is set to, as it opened or changed:
+    /// `set` when that isn't the gain `asked` for (the radio's nearest step, or
+    /// within its range here), which the log says and the status shows.
+    pub fn source_gain(&mut self, source: usize, asked: &str, set: Option<String>) {
+        if let Some(set) = &set {
+            let text = format!("{}: gain {asked} is set as {set} (the radio's nearest)", self.cfg.sources.get(source).map_or_else(|| format!("Source {}", source + 1), |s| s.title(source)));
+            self.records.push(Record::text(Level::Info, None, text));
+        }
+        if let Some(s) = self.stats.get(source) {
+            s.lock().unwrap().gain_set = set;
+        }
+    }
+
     /// A finite source ran out; true when all have.
     pub fn source_ended(&mut self, source: usize) -> bool {
         self.stats[source].lock().unwrap().ended = true;
@@ -670,6 +720,10 @@ impl Session {
                 let dt = if self.last_plugin_status_ms == 0.0 { 0.0 } else { (now_ms - self.last_plugin_status_ms) / 1000.0 };
                 self.last_plugin_status_ms = now_ms;
                 out.push(Output::Plugin(HostMessage::Status(self.plugin_status(dt))));
+            }
+            if self.plugin_topics.totals && now_ms - self.last_plugin_totals_ms >= TOTALS_EVERY_MS {
+                self.last_plugin_totals_ms = now_ms;
+                out.push(Output::Plugin(HostMessage::Totals(self.plugin_totals(start / 1000.0))));
             }
             self.poll_share(now_ms, out);
             let load = self.busy_ms() / (now_ms - start).max(1.0);
@@ -820,7 +874,7 @@ impl Session {
             .iter()
             .map(|s| {
                 let s = s.lock().unwrap();
-                SourceCounts { samples: s.samples, dropped: s.dropped, errors: s.errors, rate_measured: s.rate_measured }
+                SourceCounts { samples: s.samples, dropped: s.dropped, errors: s.errors, rate_measured: s.rate_measured, gain_set: s.gain_set.clone() }
             })
             .collect()
     }
@@ -1083,23 +1137,47 @@ impl Session {
                 let i = y.site as usize;
                 let rate = if dt > 0.0 { y.good.saturating_sub(self.plugin_good[i]) as f64 / dt } else { 0.0 };
                 self.plugin_good[i] = y.good;
-                PluginSystemStatus {
-                    index: y.system,
-                    short_name: y.short_name.clone(),
-                    site_name: y.site_name.clone(),
-                    control_channel_hz: y.control_channel_hz,
-                    decode_rate: (rate * 10.0).round() / 10.0,
-                    active_calls: y.active_calls as u32,
-                    recording: y.recording as u32,
-                    nac: y.identity.get(IdField::Nac),
-                    wacn: y.identity.get(IdField::Wacn),
-                    sys_id: y.identity.get(IdField::SysId),
-                    rfss: y.identity.get(IdField::Rfss),
-                    site: y.identity.get(IdField::Site),
-                }
+                PluginSystemStatus { scope: Self::site_scope(y), decode_rate: (rate * 10.0).round() / 10.0, active_calls: y.active_calls as u32, recording: y.recording as u32 }
             })
             .collect();
         trunk_recorder_plugin::Status { time: self.wall(st.now_s), systems }
+    }
+
+    /// Which site `y` is, as plugins are told ([`trunk_recorder_plugin::SiteScope`]).
+    fn site_scope(y: &trunk_core::trunk::SiteStatus) -> trunk_recorder_plugin::SiteScope {
+        trunk_recorder_plugin::SiteScope {
+            index: y.system,
+            short_name: y.short_name.clone(),
+            site_name: y.site_name.clone(),
+            key: y.key.clone(),
+            protocol: y.kind.to_string(),
+            control_channel_hz: y.control_channel_hz,
+            source: y.source,
+            symbol_rate: y.symbol_rate,
+            identity: y.identity.to_site(),
+        }
+    }
+
+    /// Every series' running totals for plugins, and which sites, channels and radios they're
+    /// of (`since`: when recording started, Unix s).
+    fn plugin_totals(&self, since: f64) -> trunk_recorder_plugin::Totals {
+        use trunk_recorder_plugin::{ChannelScope, ClockState, SourceScope};
+        let sites = self.engine.status().sites.iter().map(Self::site_scope).collect();
+        let channels = self
+            .engine
+            .channels()
+            .into_iter()
+            .filter_map(|c| {
+                let ChannelKind::Conventional(mode) = c.kind else { return None };
+                let short_name = self.system_name(c.system).to_string();
+                Some(ChannelScope { key: metrics::channel_key(&short_name, c.freq_hz as f64), index: c.system, short_name, freq_hz: c.freq_hz, mode: mode.as_str().to_string(), names: c.names, access: c.access, source: c.source })
+            })
+            .collect();
+        let sources = self.cfg.sources.iter().enumerate().map(|(i, s)| SourceScope { key: format!("src/{}", metrics::key_part(&s.label())), index: i, name: s.label(), driver: s.kind_name().to_string(), auto_tune: s.auto_tune }).collect();
+        // The recorder's clock less the systems': the latest any site said.
+        let system_offset_ms = self.radio_clocks().into_iter().filter(|c| c.valid).max_by(|a, b| a.at_s.total_cmp(&b.at_s)).map(|c| -c.offset_ms);
+        let clock = (self.clock_sync.is_some() || system_offset_ms.is_some()).then(|| ClockState { sync: self.clock_sync.clone(), system_offset_ms });
+        trunk_recorder_plugin::Totals { time: self.meas.now(), since, series: self.meas.totals(), sites, channels, sources, clock }
     }
 
     fn flush_log(&mut self, out: &mut Vec<Output>) {
@@ -1160,8 +1238,15 @@ impl Session {
                 if !self.want_audio {
                     return;
                 }
-                let unit_name = if audio.unit != 0 { self.unit_tag(audio.system, audio.unit) } else { String::new() };
-                out.push(Output::Audio { short_name: self.system_name(audio.system).to_string(), unit_name, audio });
+                let short_name = self.system_name(audio.system).to_string();
+                let voice_listened = self.meas.topics.has("voice");
+                let voice = (self.plugin_topics.voice || voice_listened)
+                    .then(|| {
+                        let unit_name = if audio.unit != 0 { self.unit_tag(audio.system, audio.unit) } else { String::new() };
+                        voice_chunk(&short_name, &unit_name, &audio)
+                    })
+                    .flatten();
+                out.push(Output::Audio { short_name, audio, voice, voice_listened });
             }
             Event::ConvSkipped { freq_hz, code } => {
                 let ms = self.wall(self.engine.status().now_s) * 1000.0;
@@ -1327,7 +1412,7 @@ impl Session {
                 let tune = st.sources.get(i).copied().unwrap_or_default();
                 // An error long past isn't news (its count stays).
                 let recent = ss.last_error.as_ref().filter(|_| ss.last_error_s == 0.0 || self.meas.now() - ss.last_error_s < ERROR_SHOWN_S);
-                json!({ "index": i, "label": label, "centerHz": sc.center_hz, "rateHz": sc.rate_hz, "rateMeasured": ss.rate_measured,
+                json!({ "index": i, "label": label, "centerHz": sc.center_hz, "rateHz": sc.rate_hz, "rateMeasured": ss.rate_measured, "gainSet": ss.gain_set,
                         "dropped": ss.dropped, "errors": ss.errors, "lastError": recent, "lastErrorS": recent.filter(|_| ss.last_error_s > 0.0).map(|_| ss.last_error_s.round()), "ended": ss.ended,
                         "errorPpm": tune.error_ppm, "tunePpm": tune.applied_ppm, "tuneSeeded": tune.seeded,
                         // The ppm that removes the error: it was measured against the ppm this run opened the radio with.
@@ -1343,7 +1428,7 @@ impl Session {
         // Each running site, as its control channel describes it.
         let site_json = |y: &trunk_core::trunk::SiteStatus| {
             json!({
-                "index": y.site, "name": y.site_name, "nowS": y.now_s, "controlChannelHz": y.control_channel_hz,
+                "index": y.site, "name": y.site_name, "nowS": y.now_s, "controlChannelHz": y.control_channel_hz, "source": y.source,
                 "identity": identity_json(&y.identity),
                 "good": y.good, "bad": y.bad, "modulation": if y.modulation.is_empty() { None } else { Some(y.modulation) },
                 "activeCalls": y.active_calls, "recording": y.recording, "callsConcluded": y.calls_concluded,
@@ -1417,9 +1502,9 @@ pub fn call_entry(rel: &str, record: &trunk_recorder_plugin::CallRecord) -> Valu
 }
 
 /// A site's identity as messages carry it: the config's [`crate::config::SiteIdentity`]
-/// (`{nac, wacn, sysId, rfss, site}`, a field not stated yet left out).
+/// (`{nac, wacn, sysId, rfss, site, colorCode, network, ran}`, a field not stated yet left out).
 pub(crate) fn identity_json(id: &Identity) -> Value {
-    json!(crate::config::SiteIdentity::from(id))
+    json!(id.to_site())
 }
 
 /// The name a site's band plan is kept under ([`trunk_core::trunk::SiteKey::file_stem`]).
@@ -1475,10 +1560,11 @@ fn decode_sites(engine: &Engine, names: &NameBook, system: &str) -> (Vec<Value>,
                 json!({
                     "variant": d.variant.map(|v| v.name()),
                     "colorCode": d.color_code,
+                    // Tier III / Capacity Max: its System Identity Code, beside the network and
+                    // site it gives the identity.
+                    "sysCode": d.sys_code.map(|c| json!({ "code": c.0, "model": c.model(), "category": c.category() })),
                     "rest": d.rest.map(|(lsn, hz)| json!({ "lsn": lsn, "freqHz": if hz > 0 { Some(hz) } else { None } })),
                     "keyed": d.keyed,
-                    "xpt": d.xpt,
-                    "availableRepeaters": d.xpt.as_ref().map(|x| x.available_repeaters()),
                     "channels": d.channels.iter().map(|c| json!({ "lcn": c.lcn, "freqHz": c.hz, "configured": c.configured })).collect::<Vec<_>>(),
                     "carriers": d.carriers.iter().map(|c| json!({
                         "freqHz": c.hz, "control": c.control, "colorCode": c.color_code,
@@ -1670,6 +1756,32 @@ mod tone_tests {
         let feed = out.iter().find_map(|o| match o { Output::Message(ToClient::MonitorEvent(b)) => b.get("alphaTag").cloned(), _ => None });
         assert_eq!(feed, Some(json!("Fire Dispatch")));
     }
+
+    /// Live voice's frames are built only while plugins take topic `voice` or
+    /// interfaces listen with it, and go to interfaces only in the second case.
+    #[test]
+    fn live_voice_is_built_for_whoever_takes_it() {
+        use trunk_recorder_plugin::{Codec, FrameKind, VoiceFrame};
+        let cfg: Config = serde_json::from_value(json!({
+            "sources": [{ "type": "rtlsdr", "serial": "", "centerHz": 155000000, "rateHz": 2400000, "gainDb": 25, "agc": false, "ppm": 0 }],
+            "conventional": [{ "shortName": "wood", "channels": [{ "freqHz": 155200000, "mode": "fm", "name": "Fire Dispatch" }] }]
+        }))
+        .unwrap();
+        let mut s = Session::new(cfg, &Default::default(), 1.75e12, &|_| None, |_| 0).unwrap();
+        let frame = VoiceFrame { codec: Codec::Imbe, bits: vec![0; 88], e0: 0, errs: 0, erased: false, kind: FrameKind::Voice, tone: None };
+        let audio = LiveAudio { call_id: 7, system: 0, talkgroup: 1, unit: 0, samples: vec![0.0; 160], frames: vec![frame], decrypted: false };
+        let live = |s: &mut Session| {
+            let mut out = Vec::new();
+            s.handle(Event::Audio(audio.clone()), &mut out);
+            out.into_iter().find_map(|o| match o { Output::Audio { voice, voice_listened, .. } => Some((voice.is_some(), voice_listened)), _ => None }).unwrap()
+        };
+        assert_eq!(live(&mut s), (false, false), "nobody takes it");
+        s.plugin_topics.voice = true;
+        assert_eq!(live(&mut s), (true, false), "plugins only");
+        s.plugin_topics.voice = false;
+        s.set_topics(crate::stats::Topics::new(["voice".to_string()]));
+        assert_eq!(live(&mut s), (true, true), "an interface listens with voice");
+    }
 }
 #[cfg(test)]
 mod name_tests {
@@ -1706,7 +1818,7 @@ mod plugin_tests {
         .unwrap();
         let mut s = Session::new(cfg, &Default::default(), 1.75e12, &|_| None, |_| 0).unwrap();
         let mut call = trunk_core::trunk::Call { talkgroup: 1001, ..Default::default() };
-        call.sources.push(trunk_core::trunk::CallSource { src: 1234567, time_s: 1.0, audio_pos: None, flags: Default::default(), position: None });
+        call.sources.push(trunk_core::trunk::CallSource { src: 1234567, time_s: 1.0, ..Default::default() });
         let updates = |s: &mut Session, c: &trunk_core::trunk::Call| {
             let mut out = Vec::new();
             s.handle(Event::CallUpdate(c.clone()), &mut out);

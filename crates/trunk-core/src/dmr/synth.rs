@@ -281,6 +281,23 @@ mod tests {
     }
 
     #[test]
+    fn an_auto_channel_settles_on_dmr() {
+        let (fs, center, freq) = (1_200_000.0, 460_000_000.0, 460_050_000.0);
+        let cfg = EngineConfig {
+            sources: vec![SourceConfig { center_hz: center, rate_hz: fs, auto_tune: false, guard_hz: crate::trunk::DEFAULT_GUARD_HZ }],
+            conventional: vec![ConvChannel::new(freq, ConvMode::Auto)],
+            ..Default::default()
+        };
+        let done = run(cfg, &wideband(fs, freq - center));
+        assert_eq!(done.len(), 1, "{:?}", done.iter().map(|k| &k.call).collect::<Vec<_>>());
+        let c = &done[0].call;
+        assert_eq!((c.talkgroup, c.voice.slot(), c.voice.color_code()), (4321, Some(1), Some(5)));
+        assert_eq!(c.sources.iter().map(|s| s.src).collect::<Vec<_>>(), [98765]);
+        let secs = done[0].audio.len() as f64 / 8000.0;
+        assert!((secs - 6.0 * 0.36).abs() < 0.2, "{secs:.2} s of audio");
+    }
+
+    #[test]
     fn engine_records_a_conventional_dmr_call_on_its_slot() {
         // The squelch's noise floor is per 1/64 of the band: wide enough here that the carrier isn't it.
         let (fs, center, freq) = (1_200_000.0, 460_000_000.0, 460_050_000.0);
@@ -436,7 +453,7 @@ mod tests {
             sources: vec![SourceConfig { center_hz: center, rate_hz: fs, auto_tune: false, guard_hz: crate::trunk::DEFAULT_GUARD_HZ }],
             systems: vec![SystemConfig::trunked("xpt", vec![SiteConfig {
                 control_channels: vec![frequencies[0] as f64],
-                protocol: crate::trunk::Protocol::Dmr(DmrConfig { lcn_table: BTreeMap::from([(1, frequencies[0]), (2, frequencies[1])]), ..Default::default() }),
+                protocol: crate::trunk::Protocol::Dmr(DmrConfig { channels: vec![frequencies[1] as f64], lcn_table: BTreeMap::from([(1, frequencies[0]), (2, frequencies[1])]), ..Default::default() }),
                 ..Default::default()
             }])], ..Default::default()
         };
@@ -449,6 +466,23 @@ mod tests {
             assert!(d.audio.len() > 8_000, "clear voice passes the existing AMBE decoder");
         }
         assert!(matches!(&engine.status().sites[0].protocol, ProtocolStatus::Dmr(d) if d.variant == Some(Variant::Xpt)));
+    }
+
+    /// A carrier's link control reaches the decoders with XPT's 16-bit IDs only
+    /// once the channel knows it is XPT's (its site or control channel said so).
+    #[test]
+    fn xpt_ids_come_from_the_channel_once_it_knows_the_variant() {
+        use crate::dmr::{Burst, Variant};
+        let lc = [3, 0x68, 0x40, 0xab, 0, 25, 0xcd, 0x12, 0x34];
+        let burst = Burst { cach: cach_dibits(0), dibits: lc_burst(1, DT_VOICE_LC_HEADER, &lc, SyncKind::BsData), rel: [1.0; 264], sync: Some(SyncKind::BsData), sync_errs: 0, sample: 0.0 };
+        for (variant, ids) in [(None, (0xab0019, 0xcd1234)), (Some(Variant::CapacityPlus), (0xab0019, 0xcd1234)), (Some(Variant::Xpt), (25, 0x1234))] {
+            let mut chan = Channel::default();
+            chan.variant = variant;
+            let mut out = Vec::new();
+            chan.burst(&burst, &mut out);
+            let lc = out.iter().find_map(|(_, e)| match e { SlotEvent::Lc { lc, .. } => Some(*lc), _ => None }).unwrap();
+            assert_eq!((lc.target(), lc.source()), ids, "{variant:?}");
+        }
     }
 
 }

@@ -672,7 +672,7 @@ pub(crate) fn keep(v: &Value, keys: &[&str]) -> Value {
 
 pub(crate) const RECORDING_KEYS: &[&str] = &["callTimeoutS", "conversationMode", "recordUnknown", "recordEncrypted", "recordUnitToUnit", "keepSilentCalls", "minCallS", "maxCallS", "minTransmissionS", "prerollS", "maxRecorders", "vocoder", "normalizeAudio", "digitalLevelDb", "analogLevelDb", "dropDuplicateCalls"];
 const SYSTEM_KEYS: &[&str] = &["shortName", "type", "enabled", "defaultMode", "nxdnType", "preferredSite", "receiveOn", "sites", "recording"];
-const SITE_KEYS: &[&str] = &["name", "enabled", "controlChannelsHz", "modulation", "expect", "voiceChannelsHz", "bandplan", "bandplanBaseHz", "bandplanSpacingHz", "bandplanOffset", "bandplanHighHz", "lcnTableHz", "dmrChannelsHz", "dmrColorCodes", "xptHomeGroups", "colorCode", "nxdnRate", "nxdnChannelsHz", "ran", "esk"];
+const SITE_KEYS: &[&str] = &["name", "enabled", "controlChannelsHz", "modulation", "expect", "voiceChannelsHz", "bandplan", "bandplanBaseHz", "bandplanSpacingHz", "bandplanOffset", "bandplanHighHz", "lcnTableHz", "dmrChannelsHz", "colorCode", "nxdnRate", "nxdnChannelsHz", "ran", "esk"];
 const CONVENTIONAL_KEYS: &[&str] = &["shortName", "enabled", "squelchDb", "demod", "channels", "recording"];
 const CHANNEL_KEYS: &[&str] = &["freqHz", "mode", "talkgroup", "code", "slot", "matchTalkgroup", "squelchDb", "bandwidthKhz", "enabled", "receiveOn", "autoTune"];
 pub(crate) const RADIO_KEYS: &[&str] = &["type", "rateHz", "ppm", "autoTune", "guardHz", "gainDb", "agc", "antenna", "wireFormat", "gainMode", "gainStep", "lnaStep", "mixerStep", "vgaStep", "lnaDb", "vgaDb", "amp", "biasTee", "gains", "bufLen", "buffers", "packing"];
@@ -901,7 +901,7 @@ pub fn review(ctx: &Ctx, id: u64, name: &str) -> ToClient {
     let reviewed = (|| -> Result<ToClient, String> {
         let dir = capture_dir(ctx, name)?;
         let opened = open(dir.to_str().ok_or("Its path isn't text")?)?;
-        let images = opened.recordings.iter().map(crate::waterfall::of_recording).collect::<Result<Vec<_>, _>>()?;
+        let images = opened.recordings.iter().map(|r| crate::waterfall::of_recording(r).map(|(image, _)| image)).collect::<Result<Vec<_>, _>>()?;
         let read = |f: &str| fs::read_to_string(dir.join(f)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
         let waterfalls = images.into_iter().map(|i| IqWaterfall { width: i.width, height: i.height, levels: crate::toolkit::hex(&i.pixels) }).collect();
         Ok(ToClient::IqCaptureReview { id, name: name.to_string(), metadata: read("source-0.sigmf-meta").map_or(Value::Null, |m| m["global"].clone()), diagnostics: read(DIAGNOSTICS).unwrap_or(Value::Null), waterfalls, error: None })

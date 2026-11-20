@@ -37,8 +37,8 @@ In **Setup** → **Systems**, **Add a system** and set **Type** to **DMR (trunke
 - **Voice frequencies, MHz** (`dmrChannelsHz`): for Tier III, Capacity Max and Connect Plus, the
   site's voice frequencies. This is Trunk Recorder's `channels`.
 - **Colour code** (`colorCode`): leave empty ("auto") to take the control channel's.
-- **Channel table (optional)** (`lcnTableHz`): channel numbers you already know, as
-  `101=452.275, 102=452.300`. This is Trunk Recorder's `lcnTable`. Mapped frequencies are also watched. Leave it empty to learn them (XPT requires explicit repeater mappings).
+- **Channel table** (`lcnTableHz`): channel numbers you already know, as
+  `101=452.275, 102=452.300`. This is Trunk Recorder's `lcnTable`. Leave it empty to learn them.
 
 In the config file (frequencies in Hz):
 
@@ -81,6 +81,14 @@ channel and slot. The recorder turns the channel number into a frequency from, i
    (some Tier III systems);
 3. what it has learned.
 
+**System code.** Tier III and Capacity Max control channels send a 16-bit System Identity Code
+(in C_ALOHA and C_BCAST). Its model (Tiny, Small, Large or Huge) sets how the rest splits into a
+network and a site, which become the site's identity beside its colour code: a site can be locked
+to them with `expect` (`{ "network": 12, "site": 4 }`). The Decode page's line under the graphs
+shows them with the code, its model and which category of radio may use the site, for example
+`B013`, Large, network 12, site 4, category A+B. The log notes it when first heard and whenever it
+changes.
+
 **Learning a channel.** When a grant names a channel it doesn't know, the recorder notes the
 talkgroup and slot and waits up to 4 seconds. If that talkgroup's link control then shows up on
 the same slot of one of the watched voice frequencies, that frequency is the channel. The log
@@ -121,6 +129,34 @@ Encrypted transmissions (the link control's privacy bit, or a privacy header) ar
 out of the audio. A call that was all encrypted is kept, without audio, only when
 `recordEncrypted` is `true` in the config file; there is no switch for it in Setup. The recorder
 can't decrypt anything.
+
+## Over-the-air radio names
+
+DMR talker aliases are decoded from embedded link control on trunked and
+conventional channels. Supported forms are standard FID `0x00` and Hytera FID
+`0x68` (FLCO `0x04`–`0x07`), and Motorola FID `0x10` (FLCO `0x14`–`0x17`).
+The four encodings are 7-bit ASCII, ISO-8859-1, UTF-8 and UTF-16BE. Lengths
+are code units, not displayed characters; multibyte characters and UTF-16
+surrogate pairs may cross fragments.
+
+Complete, valid aliases with fresh voice LC identifying the radio use the
+existing learned-radio-name store and name-priority settings. Assembly is
+independent for each carrier and slot. Missing/out-of-order/conflicting blocks,
+new headers, source/talkgroup changes, matching voice termination, protected LC
+and four-second timeouts discard incomplete state. An alias cannot establish
+a call's identity or change its encryption state.
+
+`tool dmr` emits `alias` JSON records with text, format, declared/received code
+units and `complete` (its `lc` records name the radio). Valid partial Unicode
+prefixes are shown without replacement characters; partial or unattributed
+results never overwrite saved radio names. For example, the supplied Hytera
+capture declares 13 UTF-16 units but only supplies six (`Hytera`) before its
+alias header repeats. This remains a partial diagnostic, not a learned name.
+
+No alias is invented when the feature is disabled or fragments are absent.
+Clear alias LC can be decoded even when audio is encrypted; protected/encrypted
+LC itself is not decrypted. Protocol layouts follow ETSI TS 102 361-2 V2.5.1
+§§7.1.1.4–5 and 7.2.18–19.
 
 ## Several sites
 

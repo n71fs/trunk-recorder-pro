@@ -136,7 +136,7 @@ store keeps two indexes for finding calls:
 They're used when you pick a talkgroup or a radio on the dashboard's **Radio** page, whose call
 list pages back as far as the store keeps calls. They're also used by anything else that asks the
 recorder for one talkgroup's or one radio's calls: `callsQuery` with `talkgroup` or `unit`
-(interfaces, `client.js`'s `rec.calls`), `GET /api/v1/calls?talkgroup=…` or `?unit=…`, and
+(interfaces, `client.js`'s `rec.queryCalls`), `GET /api/v1/calls?talkgroup=…` or `?unit=…`, and
 plugins' `calls.query`.
 
 Turning one off saves the writes it costs. Its lists then show only the recent calls, and the
@@ -380,7 +380,7 @@ then Start). A few apply at once:
 |---|---|---|
 | A trunked system's talkgroup file: an Ignore or Priority change takes effect immediately | Sources, systems, conventional channels, squelch | `server.bind`, `server.port` |
 | Plugin settings (`plugins`, each system's `plugins`) and `recording.m4a`: running plugins restart with them | Recording rules, `filenameFormat`, `captureDir` | |
-| `log` settings, `monitor` (the hosts checked, the time server, the Checks switch) | `recording.ramSpool` (the interface says "from the next start") | |
+| `log` settings, `monitor` (the hosts checked, the time server, the Checks switch, the update check) | `recording.ramSpool` (the interface says "from the next start") | |
 | `server.allowedOrigins`, `server.interfaces` (an interface moves to its new port at once) | A linked `channelFile` is re-read at every Start | |
 
 ## Files kept beside the config

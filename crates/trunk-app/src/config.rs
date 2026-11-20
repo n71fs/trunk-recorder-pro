@@ -10,7 +10,7 @@ use trunk_core::dsp::inband::pattern::PatternKind;
 use trunk_core::dsp::AnalogTuning;
 use trunk_core::p25::diversity::BankConfig;
 use trunk_core::trunk::{
-    check_channels, Access, CallConfig, Protocol, ConvChannel, Talkgroups, ConvConfig, ConvMode, EngineConfig, IdField, Identity, SaveRules, SourceConfig,
+    check_channels, Access, CallConfig, Protocol, ConvChannel, Talkgroups, ConvConfig, ConvMode, EngineConfig, Identity, SaveRules, SourceConfig,
     SiteConfig, SystemConfig, Talkgroup, UnitTags, UnitTagsMode,
 };
 pub use trunk_core::trunk::{usable_half_width, DEFAULT_GUARD_HZ};
@@ -341,7 +341,7 @@ impl Source {
     }
     /// It to place: its centre stays when set.
     pub fn placing(&self) -> Placing {
-        Placing { rate_hz: self.rate_hz, guard_hz: self.guard_hz, fixed_hz: (self.center_hz > 0.0).then_some(self.center_hz) }
+        Placing { rate_hz: self.rate_hz, guard_hz: self.guard_hz, fixed_hz: (self.center_hz > 0.0).then_some(self.center_hz), band: None }
     }
     /// Its `type` ("rtlsdr", "airspy", …), as the config names it.
     pub fn kind_name(&self) -> &'static str {
@@ -646,12 +646,6 @@ pub struct Site {
     /// Recorder's `channels`; Capacity Plus: every repeater of the site).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dmr_channels_hz: Vec<f64>,
-    /// DMR: frequency Hz → color code, for repeaters with differing codes.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub dmr_color_codes: BTreeMap<String, u8>,
-    /// XPT: home talkgroup → logical repeater, from site programming.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub xpt_home_groups: BTreeMap<String, u32>,
     /// DMR: only this colour code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color_code: Option<u8>,
@@ -947,7 +941,7 @@ impl Site {
     /// Frequencies a watching protocol (DMR, NXDN, EDACS) needs besides the control channels.
     pub fn watched_channels(&self, sys: &System) -> Vec<f64> {
         if sys.is_dmr() {
-            self.dmr_channels_hz.iter().copied().chain(self.lcn_table_hz.values().copied()).collect()
+            self.dmr().channels
         } else if sys.is_nxdn() {
             self.nxdn_channels_hz.clone()
         } else if sys.is_edacs() {
@@ -963,19 +957,7 @@ impl Site {
             lcn_table: self.lcn_table(),
             channels: self.dmr_channels_hz.clone(),
             color_code: self.color_code,
-            color_codes: self.dmr_color_codes.iter().filter_map(|(f, &cc)| Some((f.trim().parse().ok()?, cc))).collect(),
-            home_groups: self.xpt_home_groups.iter().filter_map(|(g, &r)| Some((g.trim().parse().ok()?, r))).collect(),
         }
-    }
-
-    fn dmr_problem(&self) -> Option<String> {
-        if self.color_code.is_some_and(|cc| cc > 15) || self.dmr_color_codes.iter().any(|(f, &cc)| cc > 15 || f.trim().parse::<u64>().ok().is_none_or(|hz| hz == 0)) {
-            return Some("DMR color codes must be 0–15; dmrColorCodes keys must be frequencies in integer Hz.".into());
-        }
-        if self.xpt_home_groups.iter().any(|(g, &r)| g.trim().parse::<u32>().ok().is_none_or(|g| g == 0 || g > 255) || !(1..=8).contains(&r)) {
-            return Some("XPT home groups must map group IDs 1–255 to repeaters 1–8.".into());
-        }
-        None
     }
 
     /// `lcnTableHz` with numbers for keys and frequencies in Hz (the keys that parse).
@@ -1061,8 +1043,6 @@ impl Default for Site {
             bandplan_high_hz: 0.0,
             lcn_table_hz: Default::default(),
             dmr_channels_hz: vec![],
-            dmr_color_codes: Default::default(),
-            xpt_home_groups: Default::default(),
             color_code: None,
             nxdn_rate: NxdnRate::default(),
             nxdn_channels_hz: vec![],
@@ -1073,47 +1053,10 @@ impl Default for Site {
     }
 }
 
-/// A P25 site's identity. NAC, WACN and System ID are shown in hex.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SiteIdentity {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nac: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wacn: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sys_id: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rfss: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub site: Option<u32>,
-}
-
-/// What a control channel says of itself, as the config writes a site's
-/// identity: the one shape status, the survey and the config share.
-impl From<&Identity> for SiteIdentity {
-    fn from(id: &Identity) -> Self {
-        SiteIdentity {
-            nac: id.get(IdField::Nac).map(|v| v as u16),
-            wacn: id.get(IdField::Wacn),
-            sys_id: id.get(IdField::SysId),
-            rfss: id.get(IdField::Rfss),
-            site: id.get(IdField::Site),
-        }
-    }
-}
-
-impl SiteIdentity {
-    pub(crate) fn engine(&self) -> Identity {
-        let mut id = Identity::default();
-        id.set_opt(IdField::Nac, self.nac.map(u32::from));
-        id.set_opt(IdField::Wacn, self.wacn);
-        id.set_opt(IdField::SysId, self.sys_id);
-        id.set_opt(IdField::Rfss, self.rfss);
-        id.set_opt(IdField::Site, self.site);
-        id
-    }
-}
+/// A site's identity: what a site expects (`expect`), and what a control channel said of
+/// itself in status and the survey. NAC, WACN and System ID are shown in hex. (The plugin
+/// SDK's: plugins are told it too.)
+pub use trunk_core::trunk::identity::SiteIdentity;
 
 /// A conventional system (Trunk Recorder's `conventional`, `conventionalP25`
 /// and `conventionalDMR` systems): channels of one frequency each, found by
@@ -1293,8 +1236,9 @@ impl Demod {
 
     /// Channel `c`'s tuning: the mode's (and frequency's) defaults, with these and its bandwidth.
     fn tuning(&self, c: &Channel) -> AnalogTuning {
-        let mut t = if c.mode == ChannelMode::Am { AnalogTuning::am(c.freq_hz) } else { AnalogTuning::default() };
-        if let Some(khz) = c.bandwidth_khz {
+        let mut t = if c.mode == ConvMode::Am { AnalogTuning::am(c.freq_hz) } else { AnalogTuning::default() };
+        // (Its analog receiver's: an auto channel opens as wide as it.)
+        if let Some(khz) = c.bandwidth_khz.filter(|_| c.mode.has_analog_receiver()) {
             t.half_bw_hz = khz * 500.0;
         }
         if self.fm_deemphasis == Some(false) {
@@ -1316,43 +1260,12 @@ impl Demod {
     }
 }
 
-choice! {
-    pub enum ChannelMode {
-        /// Analog FM (narrowband unless its bandwidth says wide).
-        #[default]
-        Fm = "fm",
-        /// Analog AM (airband).
-        Am = "am",
-        /// P25 Phase 1.
-        P25 = "p25",
-        /// DMR (both slots).
-        Dmr = "dmr",
-        /// NXDN at 4800 bps (6.25 kHz).
-        Nxdn48 = "nxdn48",
-        /// NXDN at 9600 bps (12.5 kHz).
-        Nxdn96 = "nxdn96",
-    }
-}
-
-impl ChannelMode {
-    pub fn conv(self) -> ConvMode {
-        match self {
-            ChannelMode::Fm => ConvMode::Fm,
-            ChannelMode::Am => ConvMode::Am,
-            ChannelMode::P25 => ConvMode::P25,
-            ChannelMode::Dmr => ConvMode::Dmr,
-            ChannelMode::Nxdn48 => ConvMode::Nxdn(trunk_core::nxdn::Rate::N48),
-            ChannelMode::Nxdn96 => ConvMode::Nxdn(trunk_core::nxdn::Rate::N96),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
     pub freq_hz: f64,
     #[serde(default)]
-    pub mode: ChannelMode,
+    pub mode: ConvMode,
     /// Short name (Trunk Recorder's alpha tag).
     #[serde(default)]
     pub name: String,
@@ -1406,7 +1319,8 @@ fn usrp_gain() -> f64 {
     40.0
 }
 
-fn yes() -> bool {
+/// `true`, as a serde default.
+pub(crate) fn yes() -> bool {
     true
 }
 
@@ -1434,7 +1348,7 @@ pub fn keep_p25_numbers(channels: &mut [Channel]) -> usize {
     for i in 0..channels.len() {
         let c = &channels[i];
         let shared = channels.iter().filter(|o| (o.freq_hz - c.freq_hz).abs() < 1.0).count() > 1;
-        if c.mode == ChannelMode::P25 && shared && c.talkgroup.is_none() {
+        if c.mode == ConvMode::P25 && shared && c.talkgroup.is_none() {
             channels[i].talkgroup = Some(defaults[i]);
             n += 1;
         }
@@ -1443,25 +1357,16 @@ pub fn keep_p25_numbers(channels: &mut [Channel]) -> usize {
 }
 
 impl Channel {
-    pub fn conv_mode(&self) -> ConvMode {
-        self.mode.conv()
-    }
-
-    /// FM or AM.
-    pub fn analog(&self) -> bool {
-        matches!(self.mode, ChannelMode::Fm | ChannelMode::Am)
-    }
-
     /// What it records (code, slot and talkgroup), read for its mode.
     pub fn parsed_access(&self) -> Result<Option<Access>, String> {
-        Access::join(self.conv_mode(), &self.code, self.slot, self.match_talkgroup)
+        Access::join(self.mode, &self.code, self.slot, self.match_talkgroup)
     }
 
     /// `code`, `slot` and `matchTalkgroup` from one string as people write
     /// it (`CC1 TS2 TG201`, `NAC 293 TG 1`, `151.4`): the old `tone`, a
     /// RadioReference paste. Left as it is if it doesn't read.
     pub fn set_access(&mut self, text: &str) -> Result<(), String> {
-        let (code, slot, tg) = Access::parse(self.conv_mode(), text)?.map_or((String::new(), None, None), Access::parts);
+        let (code, slot, tg) = Access::parse(self.mode, text)?.map_or((String::new(), None, None), Access::parts);
         (self.code, self.slot, self.match_talkgroup) = (code, slot, tg);
         Ok(())
     }
@@ -1471,12 +1376,12 @@ impl Channel {
         let named = !(self.name.is_empty() && self.description.is_empty() && self.tag.is_empty() && self.group.is_empty());
         ConvChannel {
             freq_hz: self.freq_hz,
-            mode: self.conv_mode(),
+            mode: self.mode,
             talkgroup: self.talkgroup,
             default_talkgroup,
             info: named.then(|| Talkgroup {
                 number: tg,
-                mode: if self.analog() { "A".into() } else { "D".into() },
+                mode: self.mode.talkgroup_mode().into(),
                 alpha_tag: self.name.clone(),
                 description: self.description.clone(),
                 tag: self.tag.clone(),
@@ -2151,11 +2056,14 @@ pub struct MonitorSettings {
     /// The clock off by this much or more, ms: a warning, and calls marked
     /// `clock_off` (a problem at 5 s, or 4 times this). Applies at once.
     pub clock_warn_ms: f64,
+    /// Ask GitHub once a day for the app's latest release: the dashboard
+    /// says when there's a newer one. Applies at once.
+    pub check_updates: bool,
 }
 
 impl Default for MonitorSettings {
     fn default() -> Self {
-        MonitorSettings { check_hosts: Vec::new(), check_every_s: 15, network_checks: true, time_server: "pool.ntp.org".into(), clock_warn_ms: 250.0 }
+        MonitorSettings { check_hosts: Vec::new(), check_every_s: 15, network_checks: true, time_server: "pool.ntp.org".into(), clock_warn_ms: 250.0, check_updates: true }
     }
 }
 
@@ -2767,8 +2675,9 @@ impl Config {
                     if !(1e6..=20e6).contains(&s.rate_hz) {
                         return Some(format!("{}: a HackRF runs at 1 to 20 MSPS.", s.title(i)));
                     }
-                    if *lna_db > 40 || lna_db % 8 != 0 || *vga_db > 62 || vga_db % 2 != 0 {
-                        return Some(format!("{}: a HackRF's LNA gain is 0–40 dB in 8 dB steps, its VGA gain 0–62 dB in 2 dB steps.", s.title(i)));
+                    let ((lna_max, lna_by), (vga_max, vga_by)) = (crate::gain::HACKRF_LNA, crate::gain::HACKRF_VGA);
+                    if *lna_db > lna_max || lna_db % lna_by != 0 || *vga_db > vga_max || vga_db % vga_by != 0 {
+                        return Some(format!("{}: a HackRF's LNA gain is 0–{lna_max} dB in {lna_by} dB steps, its VGA gain 0–{vga_max} dB in {vga_by} dB steps.", s.title(i)));
                     }
                 }
                 SourceKind::Hydrasdr { rf_port, bias_tee, .. } => {
@@ -2813,9 +2722,6 @@ impl Config {
                 if let Err(e) = s.smartnet(sys) {
                     return Some(format!("{name}: {e}"));
                 }
-            }
-            if sys.is_dmr() {
-                if let Some(error) = s.dmr_problem() { return Some(format!("{name}: {error}")); }
             }
             if sys.is_dmr() || sys.is_nxdn() || sys.is_edacs() {
                 let out: Vec<String> = g.need_missed.iter().map(|f| format!("{:.5}", f / 1e6)).collect();
@@ -2909,7 +2815,7 @@ impl Config {
                 let rules = self.recording.with(&sys.recording);
                 let sites = sys
                     .active_sites()
-                    .map(|s| SiteConfig { name: sys.site_name(s).to_string(), control_channels: s.control_channels_hz.clone(), bank: s.bank(), expect: s.expect.engine(), protocol: s.protocol(sys) })
+                    .map(|s| SiteConfig { name: sys.site_name(s).to_string(), control_channels: s.control_channels_hz.clone(), bank: s.bank(), expect: Identity::of_site(&s.expect), protocol: s.protocol(sys) })
                     .collect();
                 SystemConfig {
                     calls: rules.call_config(),
@@ -3302,7 +3208,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.conventional[0].squelch_db, 8.0);
-        assert_eq!(c.conventional[0].channels[2].mode, ChannelMode::Fm);
+        assert_eq!(c.conventional[0].channels[2].mode, ConvMode::Fm);
         // No control channels: the centre is placed over the enabled channels.
         assert_eq!(c.problem(), None);
         let center = c.resolved_centers()[0];
@@ -3432,23 +3338,6 @@ mod tests {
         assert!(c.problem().unwrap().contains("Two systems are named \"police\""));
         c.systems[0].short_name = "county".into();
         assert_eq!(c.problem(), None);
-    }
-
-    #[test]
-    fn xpt_home_groups_and_per_repeater_codes_are_preserved_and_checked() {
-        let site: Site = serde_json::from_value(serde_json::json!({
-            "controlChannelsHz": [451000000], "lcnTableHz": {"1": 451000000, "2": 452000000},
-            "dmrColorCodes": {"451000000": 1, "452000000": 2}, "xptHomeGroups": {"25": 1}
-        })).unwrap();
-        let d = site.dmr();
-        assert_eq!(d.color_codes, BTreeMap::from([(451000000, 1), (452000000, 2)]));
-        assert_eq!(d.home_groups, BTreeMap::from([(25, 1)]));
-        assert!(site.dmr_problem().is_none());
-        let mut invalid = site.clone();
-        invalid.dmr_color_codes.insert("451000000".into(), 16);
-        assert!(invalid.dmr_problem().is_some());
-        let back: Site = serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap();
-        assert_eq!(back.dmr().home_groups, d.home_groups);
     }
 
     #[test]
@@ -3719,7 +3608,7 @@ mod tests {
     fn rows_sharing_a_frequency() {
         let row = |tone: &str, tg: Option<u32>| Channel {
             freq_hz: 154_325_000.0,
-            mode: ChannelMode::Fm,
+            mode: ConvMode::Fm,
             name: String::new(),
             talkgroup: tg,
             description: String::new(),
@@ -3754,7 +3643,7 @@ mod tests {
         c.conventional[0].channels[3].slot = Some(1);
         assert!(c.problem().unwrap().contains("only DMR has slots"), "{:?}", c.problem());
         // P25 rows split by talkgroup, a typed number filed under, the others the air's.
-        let p25 = |code: &str, tg: Option<u32>, m: Option<u32>| Channel { freq_hz: 154_325_000.0, mode: ChannelMode::P25, code: code.into(), match_talkgroup: m, ..row("", tg) };
+        let p25 = |code: &str, tg: Option<u32>, m: Option<u32>| Channel { freq_hz: 154_325_000.0, mode: ConvMode::P25, code: code.into(), match_talkgroup: m, ..row("", tg) };
         c.conventional[0].channels = vec![p25("293", Some(45351), Some(1)), p25("293", None, Some(2)), p25("293", None, None)];
         assert_eq!(c.problem(), None);
         let e = c.engine_channels();
@@ -3772,7 +3661,7 @@ mod tests {
         let mut c = Config { conventional: vec![Conventional::default()], ..Default::default() };
         c.conventional[0].channels = vec![Channel {
             freq_hz: 154_430_000.0,
-            mode: ChannelMode::Fm,
+            mode: ConvMode::Fm,
             name: "Fire".into(),
             talkgroup: None,
             description: String::new(),
@@ -3879,7 +3768,7 @@ mod tests {
         let c = Config::from_json(r#"{ "systems": [{ "shortName": "a", "type": "P25", "sites": [{ "controlChannelsHz": [1], "modulation": "QPSK" }], "unitNames": { "mode": " OTA " } }],
             "conventional": [{ "shortName": "c", "channels": [{ "freqHz": 1, "mode": "NXDN48" }] }], "recording": { "vocoder": "Fixed-Point", "m4a": { "encoder": "FFmpeg" } } }"#).unwrap();
         assert_eq!((c.systems[0].kind, c.systems[0].sites[0].modulation, c.systems[0].unit_names.mode), (SystemKind::P25, Modulation::Qpsk, UnitNamesMode::Ota));
-        assert_eq!((c.conventional[0].channels[0].mode, c.recording.vocoder, c.recording.m4a.encoder), (ChannelMode::Nxdn48, Vocoder::Fixed, M4aEncoder::Ffmpeg));
+        assert_eq!((c.conventional[0].channels[0].mode, c.recording.vocoder, c.recording.m4a.encoder), (ConvMode::Nxdn(trunk_core::nxdn::Rate::N48), Vocoder::Fixed, M4aEncoder::Ffmpeg));
         let saved = serde_json::to_string(&c).unwrap();
         assert!(saved.contains(r#""type":"p25""#) && saved.contains(r#""modulation":"qpsk""#) && saved.contains(r#""mode":"ota""#) && saved.contains(r#""vocoder":"fixed""#), "{saved}");
         let e = Config::from_json(r#"{ "systems": [{ "shortName": "a", "type": "p26" }] }"#).unwrap_err().to_string();
@@ -3918,6 +3807,40 @@ mod tests {
         let mut c = Config::default();
         c.sources = vec![Source { name: "Whip".into(), kind: SourceKind::Hackrf { serial: String::new(), lna_db: 4, vga_db: 20, amp: false, bias_tee: false }, ..plain }];
         assert!(c.problem().unwrap().starts_with("Source 1 (Whip): "), "{:?}", c.problem());
+    }
+
+    #[test]
+    fn a_channel_can_be_auto() {
+        let c: Config = serde_json::from_str(
+            r#"{
+                "conventional": [{ "shortName": "frs", "channels": [
+                    { "freqHz": 462562500, "mode": "auto", "name": "FRS 1" },
+                    { "freqHz": 462587500, "mode": "auto", "name": "FRS 2", "bandwidthKhz": 16 }] }],
+                "sources": [{ "type": "file", "path": "a.cu8", "centerHz": 462500000, "rateHz": 2400000, "realtime": false }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(c.problem(), None);
+        let e = c.engine_config(0.0, &Default::default());
+        assert!(e.conventional.iter().all(|x| x.mode == trunk_core::trunk::ConvMode::Auto));
+        assert_eq!(e.conventional[1].analog.half_bw_hz, 8000.0, "its analog receiver's width, as an FM channel's");
+        // Written back as it was read, every mode by its name; one not listed is refused, naming them.
+        assert!(serde_json::to_string(&c).unwrap().contains(r#""mode":"auto""#));
+        for m in trunk_core::trunk::ConvMode::ALL {
+            assert_eq!(serde_json::from_value::<trunk_core::trunk::ConvMode>(serde_json::to_value(m).unwrap()).unwrap(), m);
+        }
+        assert_eq!(serde_json::from_str::<trunk_core::trunk::ConvMode>(r#""""#).unwrap(), trunk_core::trunk::ConvMode::Fm);
+        let bad = serde_json::from_str::<trunk_core::trunk::ConvMode>(r#""tdma""#).unwrap_err().to_string();
+        assert!(bad.contains("fm, am, p25, dmr, nxdn48, nxdn96 or auto"), "{bad}");
+        // It has no code to hold: a tone on it stops Start, naming the frequency.
+        let mut bad = c.clone();
+        bad.conventional[0].channels[0].code = "100.0".into();
+        assert!(bad.problem().unwrap().contains("auto channels carry no tone or code"), "{:?}", bad.problem());
+        // Nor can a frequency be listed twice.
+        let mut twice = c.clone();
+        let first = twice.conventional[0].channels[0].clone();
+        twice.conventional[0].channels.push(first);
+        assert!(twice.problem().unwrap().contains("is auto"), "{:?}", twice.problem());
     }
 
     #[test]
