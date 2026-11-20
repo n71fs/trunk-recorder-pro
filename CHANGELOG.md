@@ -5,6 +5,25 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+## [0.3.9-gps.2] — 2026-11-20
+
+Experimental test release from the n71fs fork, based on upstream v0.3.9. This is not an official TrunkRecorder release.
+
+- Includes standard DMR and Hytera embedded GPS support from gps.1.
+- Adds CRC-checked short-data packet reassembly independently on both slots.
+- Adds experimental compressed Hytera GPS for the observed north/west flag profile, verified against the supplied Westerville-area captures.
+- Emits standalone unit-position events without requiring or creating a voice call; matching active calls can retain coordinates.
+- Decodes Hytera radio registration requests/replies, radio IPs and renewal intervals.
+- Reports previously hidden vendor control words as raw status, preserving unknown fields without inventing voice grants.
+- Adds packet/application/position JSON output to `trunk-pro tool dmr`.
+
+Validation: 522 core unit tests and two integration tests passed; CLI/application compile check passed. Nine supplied control recordings yielded eight compressed GPS reports, four registration packets, and one previously supported embedded GPS report. Synthetic 4FSK tests check conventional/trunked standalone position events, damaged packet rejection, and colour-code filtering.
+
+Limitations: compressed GPS is experimental and only the observed N/W flag combination is enabled. Other hemispheres/fix flags and motion-field units remain unverified; unknown variants stay raw. Confirmed/fragmented packets, rate-3/4 and rate-1 data, LRRP and UDT/NMEA are not implemented. Monitor the dedicated data frequency as a DMR control carrier or conventional DMR channel. Standalone position events use talkgroup 0; they do not produce a voice-call recording by themselves.
+
+User IQ recordings and exact capture-derived locations are not included in this release. See [DMR GPS documentation](https://github.com/n71fs/trunk-recorder-pro/blob/v0.3.9-gps.2/docs/guides/dmr-gps.md) for sources and decoding limits.
+
+
 - **Hytera packet GPS and radio registration**: reassembles CRC-checked
   unconfirmed rate-1/2 short data on each slot. The experimental compressed
   north/west GPS profile emits standalone unit positions; RRS requests and
