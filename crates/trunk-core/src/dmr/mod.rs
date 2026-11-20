@@ -11,6 +11,7 @@
 pub mod burst;
 pub mod alias;
 pub mod fec;
+pub mod gps;
 pub mod slot;
 pub mod synth;
 pub mod trunking;

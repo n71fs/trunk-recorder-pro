@@ -247,6 +247,99 @@ mod tests {
         assert_eq!(ch.slots[1].color_code, Some(5));
     }
 
+
+    /// Standard voice headers, GPS interleaved with ordinary embedded voice LC.
+    fn gps_dibits(t: &Tx, fid: u8) -> Vec<u8> {
+        let mut d = dibits(t);
+        let gps = [8, fid, 1, 0x80, 0, 0, 0x40, 0, 0]; // 45 N, 90 W
+        let emb = embedded_lc_encode(&unpack(&gps).try_into().unwrap());
+        for sf in (1..t.superframes).step_by(2) {
+            for pos in 1..=4 {
+                let burst = (t.idle_before + 3 + sf * 6 + pos) * 2 + t.slot as usize;
+                let start = burst * 144 + 12 + 54 + 4;
+                d[start..start + 16].copy_from_slice(&bits_to_dibits(&emb[(pos - 1) * 32..pos * 32]));
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn embedded_gps_reaches_voice_outputs_through_fec() {
+        for fid in [0, 0x68] {
+            let t = tx();
+            let mut ph = 0.0;
+            let iq = modulate(&gps_dibits(&t, fid), 24_000.0, 0.0, 1.0, &mut ph);
+            let mut rx = C4fm::dmr(24_000.0);
+            let mut syms = Vec::new();
+            rx.push(&iq, &mut syms);
+            let mut voice = crate::dmr::DmrVoice::new(1);
+            let mut out = Vec::new();
+            voice.push(&syms, 0.0, 24_000.0, &mut out);
+            let positions: Vec<_> = out.iter().filter_map(|o| match o.out {
+                crate::trunk::voice::TrackerOut::Position(p) => Some((o.slot, p)),
+                _ => None,
+            }).collect();
+            assert_eq!(positions.len(), t.superframes / 2);
+            for (slot, p) in positions {
+                assert_eq!((slot, p.unit, p.lat, p.lon), (t.slot, t.source, 45.0, -90.0));
+            }
+        }
+    }
+
+    #[test]
+    fn gps_reaches_call_json_and_unit_events_on_conventional_and_trunked_channels() {
+        let (fs, center, freq) = (1_200_000.0, 460_000_000.0, 460_050_000.0);
+        for fid in [0, 0x68] {
+            let mut ph = 0.0;
+            let iq = modulate(&gps_dibits(&tx(), fid), fs, freq - center, 0.3, &mut ph);
+            for trunked in [false, true] {
+                let mut cfg = EngineConfig {
+                    sources: vec![SourceConfig { center_hz: center, rate_hz: fs, auto_tune: false, guard_hz: crate::trunk::DEFAULT_GUARD_HZ }],
+                    ..Default::default()
+                };
+                if trunked {
+                    cfg.systems = vec![SystemConfig::trunked("gps", vec![SiteConfig { control_channels: vec![freq], protocol: crate::trunk::Protocol::Dmr(Default::default()), ..Default::default() }])];
+                } else {
+                    cfg.conventional = vec![ConvChannel::new(freq, ConvMode::Dmr)];
+                }
+                let e = Engine::new(cfg).unwrap();
+                for c in iq.chunks(8192) {
+                    e.push_iq(0, c);
+                }
+                e.finish();
+                let events = e.drain_events();
+                assert!(events.iter().any(|ev| matches!(ev, Event::UnitPosition { unit: 98765, lat, lon, .. } if (*lat, *lon) == (45.0, -90.0))), "fid {fid}, trunked {trunked}: position event");
+                let done: Vec<_> = events.iter().filter_map(|ev| match ev { Event::Concluded(c) => Some(c), _ => None }).collect();
+                assert_eq!(done.len(), 1, "fid {fid}, trunked {trunked}");
+                let src = done[0].record.src_list.iter().find(|s| s.src == 98765).unwrap();
+                assert_eq!((src.lat, src.lon), (Some(45.0), Some(-90.0)));
+                let json = done[0].record.to_json();
+                assert!(json.contains("\"lat\":45") && json.contains("\"lon\":-90"), "{json}");
+            }
+        }
+    }
+
+    #[test]
+    fn xpt_gps_uses_normalized_talker_ids_without_altering_coordinates() {
+        let t = Tx { talkgroup: 0xab0019, source: 0xcd1234, ..tx() };
+        let mut ph = 0.0;
+        let iq = modulate(&gps_dibits(&t, 0x68), 24_000.0, 0.0, 1.0, &mut ph);
+        let mut rx = C4fm::dmr(24_000.0);
+        let mut syms = Vec::new();
+        rx.push(&iq, &mut syms);
+        let mut voice = crate::dmr::DmrVoice::new(1);
+        voice.chan.variant = Some(crate::dmr::Variant::Xpt);
+        let mut out = Vec::new();
+        voice.push(&syms, 0.0, 24_000.0, &mut out);
+        assert_eq!(voice.talkgroup(t.slot), Some(25));
+        let positions: Vec<_> = out.iter().filter_map(|o| match o.out {
+            crate::trunk::voice::TrackerOut::Position(p) => Some(p),
+            _ => None,
+        }).collect();
+        assert_eq!(positions.len(), t.superframes / 2);
+        assert!(positions.iter().all(|p| (p.unit, p.lat, p.lon) == (0x1234, 45.0, -90.0)));
+    }
+
     fn run(cfg: EngineConfig, iq: &[Complex32]) -> Vec<crate::trunk::Concluded> {
         run_on(cfg, iq).0
     }

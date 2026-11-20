@@ -5,6 +5,11 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+- **DMR and Hytera embedded GPS positions**, including XPT, are kept on the
+  talking radio in the call JSON (`lat`, `lon` in `srcList`) and emitted as
+  position events, as P25 positions are. See [DMR GPS](docs/guides/dmr-gps.md)
+  for scope and protocol sources.
+
 ## [0.3.9] — 2026-11-20
 
 - **A newer release, said in the sidebar** (#173, from jlutz33): once a day, and at start, the recorder asks GitHub for
