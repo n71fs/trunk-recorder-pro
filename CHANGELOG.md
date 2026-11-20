@@ -5,6 +5,22 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+## [0.3.9-gps.1] — 2026-11-20
+
+Experimental GPS test build from the n71fs fork, based on upstream Trunk Recorder Pro v0.3.9. This is a prerelease for testing before an upstream submission, not an official TrunkRecorder release.
+
+- Decodes standard DMR and Hytera embedded GPS Info (FLCO 0x08), including XPT.
+- Saves latitude/longitude on the talking radio in call JSON and emits unit-position events through the existing P25 position pipeline.
+- Preserves DMR talker aliases, XPT radio-ID normalization, and Hytera setup-ID handling.
+- Rejects protected/no-fix words and avoids attaching GPS to a missing or stale talker.
+
+Standalone Hytera HDAP/LP, LRRP, and UDT/NMEA packet-data GPS are not decoded.
+
+Validation includes signed-coordinate reference vectors, slot isolation, stale talkers and termination, alias/GPS interleaving, synthetic 4FSK/FEC decoding, and conventional/trunked call JSON and position events. Real GPS captures still need testing.
+
+Download the package for your platform and report whether GPS coordinates appear under the expected radio in srcList. Please include the platform, DMR system type, radio model, and a short capture if available.
+
+
 - **DMR and Hytera embedded GPS positions**, including XPT, are kept on the
   talking radio in the call JSON (`lat`, `lon` in `srcList`) and emitted as
   position events, as P25 positions are. See [DMR GPS](docs/guides/dmr-gps.md)
