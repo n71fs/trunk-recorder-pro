@@ -5,22 +5,26 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
-- **Hytera data-channel signalling diagnostics**: identifies the observed
-  beacon, setup, short-status and end profiles; extracts verified radio/slot
-  fields and an experimental busy hint. Raw fields remain available, and
-  these messages do not create voice grants or frequency mappings.
+## [0.3.9-gps.3] — 2026-11-20
 
-- **Hytera packet GPS and radio registration**: reassembles CRC-checked
-  unconfirmed rate-1/2 short data on each slot. The experimental compressed
-  north/west GPS profile emits standalone unit positions; RRS requests and
-  answers report radio IPs and renewal intervals. Undocumented vendor control
-  words remain visible as raw status without creating voice grants. See
-  [DMR GPS](docs/guides/dmr-gps.md) for limits, sources, and capture validation.
+Experimental prerelease from the n71fs fork, based on upstream Trunk Recorder Pro v0.3.9. This is a test build, not an official TrunkRecorder release.
 
-- **DMR and Hytera embedded GPS positions**, including XPT, are kept on the
-  talking radio in the call JSON (`lat`, `lon` in `srcList`) and emitted as
-  position events, as P25 positions are. See [DMR GPS](docs/guides/dmr-gps.md)
-  for scope and protocol sources.
+New since gps.2:
+
+- Identifies the observed Hytera data-channel beacon, setup, short-status and end profiles.
+- Shows the source radio and slot for data setup, and the correct source radio for data-end messages. Data-end IDs occupy a different byte offset from voice IDs.
+- Adds an experimental busy indication, checked against all 325 short-status/CACH observations in the supplied recording. It is a diagnostic hint; it does not create voice grants or map frequencies.
+- Adds structured `hyteraData` and `busyHint` records to `trunk-pro tool dmr`, while keeping raw signalling bytes.
+- Keeps unsupported RRS opcodes and layouts raw.
+- Documents the new capture evidence and the supplied Hytera reference manuals.
+
+Includes all gps.2 features: standard/Hytera embedded GPS, experimental compressed north/west GPS, standalone position events and radio-registration decoding.
+
+Validation before release packaging: 526 core unit tests and two integration tests passed; CLI/application compile check passed. All nine control recordings were replayed with the same 12 application packets and nine total GPS reports. All 25 data setup words and 102 data-end words were checked against independent packet-header radio IDs.
+
+Known limits: compressed GPS supports only the observed north/west flag profile. CSBK 0x08 purpose, remaining activity bits/repeater mapping, other GPS hemisphere/fix flags, and motion-field units remain unverified. Those fields stay raw. No map interface is added. Configure the dedicated data frequency for monitoring to receive its packet GPS; standalone reports do not create audio recordings.
+
+User IQ captures, uploaded reference PDFs and exact capture-derived locations are not included. See the [DMR GPS and data signalling guide](https://github.com/n71fs/trunk-recorder-pro/blob/v0.3.9-gps.3/docs/guides/dmr-gps.md) for sources and scope.
 
 ## [0.3.9] — 2026-11-20
 
