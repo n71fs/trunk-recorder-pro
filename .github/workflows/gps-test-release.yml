@@ -1,0 +1,53 @@
+# Fork-only: make completed GPS test packages available even while another
+# platform waits for a hosted runner. The normal build still publishes all
+# packages when it finishes. Keep this workflow out of the upstream GPS PR.
+name: publish GPS test packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build workflow run containing the tested packages
+        required: true
+        type: string
+      tag:
+        description: Existing GPS prerelease tag (vX.Y.Z-gps.N)
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'n71fs/trunk-recorder-pro'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Verify prerelease, source commit and required checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-gps\.[0-9]+$ ]]
+          gh api "repos/$GH_REPO/releases/tags/$TAG" | jq -e '.prerelease and (.draft | not)'
+          sha=$(gh api "repos/$GH_REPO/commits/$TAG" --jq '.sha')
+          gh api "repos/$GH_REPO/actions/runs/$RUN_ID" | jq -e --arg sha "$sha" '.head_sha == $sha and .path == ".github/workflows/build.yml"'
+          gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" > jobs.json
+          for check in test web perf; do
+            jq -e --arg name "$check" '.jobs | any(.name == $name and .conclusion == "success")' jobs.json
+          done
+      - name: Download completed packages and upload with checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$RUN_ID" --pattern 'pkg-*' --dir artifacts
+          mkdir dist
+          find artifacts -type f -name 'trunk-pro-*' -exec cp {} dist/ \;
+          (cd dist && sha256sum trunk-pro-* > SHA256SUMS)
+          gh release upload "$TAG" dist/* --clobber
