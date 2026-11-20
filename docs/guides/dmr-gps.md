@@ -152,3 +152,87 @@ GPS reports and four RRS frames (two requests and two successful answers with
 The previously supported embedded GPS report on a separate voice carrier is
 still decoded. Three recordings produced no DMR sync; that does not establish
 that they contain no other RF protocol.
+
+
+## Data-channel signalling follow-up
+
+Further correlation identifies a narrow, observed data-control profile on the
+supplied 453.6375 MHz carrier. These are capture-derived names, not a published
+Hytera air-interface specification. Every decoded form retains its raw bytes;
+other flag combinations and layouts fall back to raw vendor messages.
+
+| Message | Fields established in this capture |
+| --- | --- |
+| CSBK `8D 68` with zero remaining fields | Repeated data-channel beacon; big-endian activity word at bytes 2..4 |
+| Short LC `C`, embedded manufacturer `68` | Same activity word at bits 12..28 (MSB first) |
+| Full LC `0D`/`8D`, terminator burst | Data setup: bit 7 names slot 0/1; source radio at bytes 7..9; activity word at bytes 3..5 |
+| Full LC `30 68 F0`, terminator burst | Data end: source radio at bytes 6..8; activity word at bytes 3..5; trailing byte `60` retained |
+
+Byte ranges exclude their end. A data-end radio ID is **one byte earlier** than
+the normal voice-LC source; applying the voice layout to it produces a wrong
+radio ID. The decoder only names the exact observed fixed-field profiles.
+In particular, the setup's top bit is a slot indicator in this profile; that
+interpretation is not extended to unrelated protected LC messages.
+
+Independent checks against the packet headers show:
+
+- All 25 setup words name the radio in a following same-slot data header within
+  240 ms, and their encoded slots agree with the CACH slots.
+- All 102 end words name the latest packet's source on the same physical slot,
+  including the dispatcher replies. Repeated end words cover the hang time.
+- Across all 325 short-LC messages, `FFFF` agrees with both CACH access bits
+  being busy and `7FFF` with at least one slot available, allowing a 60 ms
+  assembly delay. The decoder exposes the high bit as an experimental busy
+  hint. The other 15 bits never vary here: their meanings and any mapping to
+  data repeater indexes are **not** established. No frequency is learned from
+  this word, and it does not prove a universal bitmap layout.
+
+CSBK `08` remains unidentified. Four identical, CRC-valid copies occur during
+one voice-call episode. Some bytes resemble the talkgroup and radio named in
+later setup signalling, but that does not establish whether the opcode means
+request, rejection, queueing, or another operation. Its flags and full payload
+remain raw; it does not generate an acknowledgement, denial, grant or position.
+
+The remaining compressed GPS hemisphere/fix flags and motion-word units also
+remain unverified. Two position reports from a moving radio give a useful
+bearing comparison, but two instantaneous values cannot uniquely establish a
+speed unit or scale. Those units are not guessed by the decoder.
+
+### Supplied Hytera documents
+
+The following documents were reviewed as reference material and are not
+redistributed in this repository:
+
+- *XPT System Product Description R3.0*, §§1.1 and 3.2.7 (printed pages 4–5,
+  16): dedicated data repeaters carry GPS/RRS separately from voice repeaters;
+  newer voice repeaters can also carry these services in certain configurations.
+- *XPT System Application Notes R5.0*, repeater-index table and §5.3 (printed
+  pages 25, 52–55; §5.3 starts on PDF page 57): data repeaters use indexes
+  16–30 and a separate data channel list; frequency-list position relates to
+  repeater index as `index = 15 + list position`. This describes configuration,
+  not how the observed activity bits map to those indexes.
+- The same Application Notes, §5.4 (printed pages 61 and 63): a repeater acting
+  as a dispatch station uses control-centre IDs 65280–65535. The captured
+  requests' destination 65280 fits that range. The answering over-the-air
+  source and the application-layer destination remain separate fields.
+- *Hytera XPT System White Paper R1.1*, the XPT Introduction, and the 2019 XPT
+  brochure: confirm dedicated data revert and distinguish Quick GPS from
+  ordinary data. Compression by itself does **not** identify Quick GPS mode.
+- *Interfaces of Hytera Digital Radios v1.07*: primarily hardware connector
+  and electrical-interface information; it does not supply the required
+  compressed GPS or proprietary signalling bit layouts.
+
+These sources confirm the architecture, not the remaining wire definitions.
+They refer developers to the separate *Hytera DMR Application Protocol
+Specification* and ADK documents, which are the relevant next references for
+LP/GPS fields. HP782 and PD782i were identified by the user as the radio models;
+firmware versions and the specific CPS GPS settings have not been established.
+
+
+The three recordings without DMR sync were additionally checked for inverted
+DMR polarity and offsets of -3000, -1500, 0, +1500 and +3000 Hz (30 runs in
+all): no DMR sync was recovered. P25, NXDN48 and NXDN96 control decoders also
+produced no valid control frames on any of the three recordings. Two have
+noise-like amplitude statistics; the third includes weak, bursty energy.
+These results do not identify another protocol or rule out a signal outside
+the captured channel filter. No new decoder is inferred from these files.

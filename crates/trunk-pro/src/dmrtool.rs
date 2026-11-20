@@ -158,6 +158,9 @@ pub fn run(a: &Args) {
                 if let Some(xpt) = dmr::xpt::control(&e) {
                     let _ = writeln!(out, "{}", serde_json::json!({ "t": t, "slot": s, "xpt": xpt }));
                 }
+                if let Some(data) = dmr::hytera::data_control(&e) {
+                    let _ = writeln!(out, "{}", serde_json::json!({ "t": t, "slot": s, "busyHint": data.busy_hint(), "hyteraData": data }));
+                }
                 match e.clone() {
                     SlotEvent::Voice { frame, .. } => {
                         vcw += 1;

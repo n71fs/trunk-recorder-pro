@@ -5,6 +5,11 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+- **Hytera data-channel signalling diagnostics**: identifies the observed
+  beacon, setup, short-status and end profiles; extracts verified radio/slot
+  fields and an experimental busy hint. Raw fields remain available, and
+  these messages do not create voice grants or frequency mappings.
+
 - **Hytera packet GPS and radio registration**: reassembles CRC-checked
   unconfirmed rate-1/2 short data on each slot. The experimental compressed
   north/west GPS profile emits standalone unit positions; RRS requests and

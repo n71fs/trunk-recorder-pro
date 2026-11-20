@@ -63,7 +63,7 @@ pub fn packet(p: &Packet) -> Message {
                         format!("registration answer result {} renewal {} s", data[4], u32::from_be_bytes(data[5..9].try_into().unwrap()))
                     }
                     (0x82, 5) => format!("status answer state {}", data[4]),
-                    _ => format!("opcode 0x{op:04x}"),
+                    _ => return m,
                 };
                 // The answering dispatcher is the sender, not the registered
                 // radio. Keep both the air source and the RRS IP explicitly.
@@ -137,10 +137,81 @@ pub fn compressed_gps(p: &Packet) -> Option<Position> {
     Some(Position { unit: p.source(), lat, lon, source: "HyteraDMRCompressed" })
 }
 
-/// Vendor words whose fields are not established. Preserve flags and raw
-/// bytes rather than interpreting them as grants, radio IDs or positions.
+/// Capture-verified data-channel profiles, not general XPT grants. The
+/// activity word is exposed without assigning its bits to repeater numbers.
+/// Radio/slot attribution was cross-checked against independent packet headers.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum DataControl {
+    Beacon { activity: u16, raw: [u8; 10] },
+    ShortStatus { activity: u16, raw: [u8; 5] },
+    Start { slot: u8, source: u16, activity: u16, raw: [u8; 9] },
+    End { source: u16, activity: u16, raw: [u8; 9] },
+}
+
+impl DataControl {
+    /// Observed high-bit busy indication, not a general repeater bitmap.
+    /// In the supplied one-data-carrier sample it agrees with both CACH
+    /// access bits (325/325 short words, allowing 60 ms assembly latency).
+    pub fn busy_hint(&self) -> bool {
+        let (Self::Beacon { activity, .. } | Self::ShortStatus { activity, .. } | Self::Start { activity, .. } | Self::End { activity, .. }) = self;
+        activity & 0x8000 != 0
+    }
+}
+
+/// Only the observed clear layouts are named. Unknown flags/layouts remain
+/// raw in `control`; these messages never create voice grants or LCN mappings.
+pub fn data_control(e: &super::slot::SlotEvent) -> Option<DataControl> {
+    use super::slot::{FID_HYTERA, LcFrom, SlotEvent};
+    let activity = |a, b| {
+        let word = u16::from_be_bytes([a, b]);
+        matches!(word, 0x7fff | 0xffff).then_some(word)
+    };
+    match e {
+        SlotEvent::Csbk { csbk, mbc: false } if csbk.0[0] == 0x8d && csbk.fid() == FID_HYTERA && csbk.0[4..].iter().all(|&b| b == 0) => {
+            Some(DataControl::Beacon { activity: activity(csbk.0[2], csbk.0[3])?, raw: csbk.0 })
+        }
+        SlotEvent::Slco(b) if b[0] >> 4 == 12 && crate::bits::field(b, 4, 12) == FID_HYTERA as u32 && b[4] & 15 == 0 => {
+            let word = crate::bits::field(b, 12, 28) as u16;
+            matches!(word, 0x7fff | 0xffff).then_some(DataControl::ShortStatus { activity: word, raw: *b })
+        }
+        SlotEvent::Lc { lc, from: LcFrom::Terminator } if lc.fid() == FID_HYTERA => {
+            let b = lc.0;
+            let word = activity(b[3], b[4])?;
+            if b[0] & 0x7f == 0x0d && b[2] == 0 && b[5] == 0x80 && b[6] == 0 {
+                let source = u16::from_be_bytes([b[7], b[8]]);
+                return (source != 0).then_some(DataControl::Start { slot: b[0] >> 7, source, activity: word, raw: b });
+            }
+            if b[0] == 0x30 && b[2] == 0xf0 && b[5] == 0 && b[8] == 0x60 {
+                // This data-end profile's source is one octet earlier than
+                // a voice LC's source. Do not use Lc::source here.
+                let source = u16::from_be_bytes([b[6], b[7]]);
+                return (source != 0).then_some(DataControl::End { source, activity: word, raw: b });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Data-control diagnostics, with unknown vendor words left raw. These
+/// statuses never create grants, frequency mappings or positions.
 pub fn control(e: &super::slot::SlotEvent) -> Option<String> {
     use super::slot::{FID_HYTERA, SlotEvent};
+    if let Some(data) = data_control(e) {
+        let busy = data.busy_hint();
+        return Some(match data {
+            DataControl::Beacon { activity, raw } => format!("Hytera data-channel beacon: activity 0x{activity:04x}, busy hint {busy}; raw {}", hex(&raw)),
+            DataControl::ShortStatus { activity, raw } => {
+                format!("Hytera data-channel short status: activity 0x{activity:04x}, busy hint {busy}; raw {}", hex(&raw))
+            }
+            DataControl::Start { slot, source, activity, raw } => {
+                format!("Hytera data start: radio {source} slot {}; activity 0x{activity:04x}, busy hint {busy}; raw {}", slot + 1, hex(&raw))
+            }
+            DataControl::End { source, activity, raw } => {
+                format!("Hytera data end: radio {source}; activity 0x{activity:04x}, busy hint {busy}; raw {}", hex(&raw))
+            }
+        });
+    }
     match e {
         SlotEvent::Csbk { csbk, mbc: false } if csbk.fid() == FID_HYTERA && matches!(csbk.opcode(), 8 | 13) => {
             Some(format!("Hytera vendor CSBK opcode 0x{:02x} PF={} raw {}", csbk.opcode(), csbk.0[0] & 0x40 != 0, hex(&csbk.0)))
@@ -210,5 +281,72 @@ mod tests {
         let m = packet(&answer);
         assert_eq!((m.kind, m.source), (MessageType::Acknowledge, 16));
         assert!(m.meta.contains("renewal 900 s") && m.meta.contains("10.0.0.123"));
+    }
+}
+
+#[cfg(test)]
+mod data_control_tests {
+    use super::*;
+    use crate::dmr::{Csbk, Lc, LcFrom, SlotEvent};
+    fn lc(b: [u8; 9]) -> SlotEvent {
+        SlotEvent::Lc { lc: Lc(b), from: LcFrom::Terminator }
+    }
+    #[test]
+    fn data_start_and_end_use_different_source_offsets() {
+        for (slot, activity) in [(0, 0x7fffu16), (1, 0xffffu16)] {
+            let [a, b] = activity.to_be_bytes();
+            let start = [0x0d | slot << 7, 0x68, 0, a, b, 0x80, 0, 0x01, 0x23];
+            assert_eq!(data_control(&lc(start)), Some(DataControl::Start { slot, source: 0x123, activity, raw: start }));
+            let end = [0x30, 0x68, 0xf0, a, b, 0, 0x01, 0x23, 0x60];
+            assert_eq!(data_control(&lc(end)), Some(DataControl::End { source: 0x123, activity, raw: end }));
+            assert_ne!(Lc(end).source(), 0x123, "generic voice source offset is wrong for data end");
+            assert_eq!(data_control(&lc(start)).unwrap().busy_hint(), activity == 0xffff);
+            assert_eq!(data_control(&lc(end)).unwrap().busy_hint(), activity == 0xffff);
+        }
+    }
+    #[test]
+    fn shared_activity_word_is_not_a_frequency_mapping_or_voice_grant() {
+        let b = [0x8d, 0x68, 0x7f, 0xff, 0, 0, 0, 0, 0, 0];
+        let e = SlotEvent::Csbk { csbk: Csbk(b), mbc: false };
+        assert_eq!(data_control(&e), Some(DataControl::Beacon { activity: 0x7fff, raw: b }));
+        assert!(crate::dmr::xpt::control(&e).is_none());
+        let raw = [0xc6, 0x87, 0xff, 0xfe, 0xe0];
+        assert_eq!(data_control(&SlotEvent::Slco(raw)), Some(DataControl::ShortStatus { activity: 0x7fff, raw }));
+        let mut other = raw;
+        other[1] ^= 0x10;
+        assert!(data_control(&SlotEvent::Slco(other)).is_none(), "short LC must name Hytera");
+    }
+    #[test]
+    fn unknown_layouts_and_embedded_words_stay_raw() {
+        let b = [0x0d, 0x68, 0, 0x7f, 0xff, 0x80, 0, 1, 0x23];
+        for (at, v) in [(0, 0x4d), (1, 0), (2, 1), (3, 0), (5, 0), (6, 1)] {
+            let mut changed = b;
+            changed[at] = v;
+            assert!(data_control(&lc(changed)).is_none(), "byte {at}");
+        }
+        for from in [LcFrom::Embedded, LcFrom::Header] {
+            assert!(data_control(&SlotEvent::Lc { lc: Lc(b), from }).is_none());
+        }
+        let e = SlotEvent::Csbk { csbk: Csbk([0x48, 0x68, 0x40, 0x40, 0x10, 0, 0x29, 0, 0x31, 0xa9]), mbc: false };
+        assert!(data_control(&e).is_none(), "opcode 8 is still unidentified");
+        assert!(control(&e).unwrap().contains("raw"));
+        assert!(data_control(&lc([0x30, 0x68, 0, 0, 0, 41, 0, 1, 0x23])).is_none(), "voice terminator is not this data-end profile");
+    }
+}
+
+#[cfg(test)]
+mod unknown_rrs_test {
+    #[test]
+    fn unknown_rrs_opcode_stays_raw_even_with_a_valid_checksum() {
+        let (header, mut payload) = crate::dmr::data::tests::rrs();
+        payload.truncate(payload.len() - 4 - (header[9] / 8) as usize);
+        payload[4] = 0x7f;
+        let sum = payload[3..11].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        payload[11] = (!sum).wrapping_add(0x33);
+        let p = crate::dmr::data::Packet { header, payload };
+        let m = super::packet(&p);
+        assert!(m.meta.starts_with("DMR short data"));
+        assert!(m.meta.contains(&super::hex(&p.payload)));
+        assert!(m.position.is_none());
     }
 }
