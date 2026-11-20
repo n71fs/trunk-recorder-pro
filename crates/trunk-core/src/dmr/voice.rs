@@ -85,7 +85,7 @@ impl DmrVoice {
         for b in std::mem::take(&mut self.bursts) {
             let t = t0 + b.sample / rate;
             self.ev.clear();
-            self.chan.burst(&b, &mut self.ev);
+            self.chan.burst_at(&b, t, &mut self.ev);
             for (slot, e) in std::mem::take(&mut self.ev) {
                 self.event(slot, e, t, out);
             }
@@ -102,6 +102,9 @@ impl DmrVoice {
         let s = &mut self.slots[slot as usize];
         let mut push = |o: TrackerOut| out.push(Out { slot, t, out: o });
         match e {
+            SlotEvent::Packet(p) => {
+                if let Some(p) = super::hytera::packet(&p).position { push(TrackerOut::Position(p)); }
+            }
             SlotEvent::Lc { lc, from } => {
                 if from == LcFrom::Embedded {
                     let talker = s.source.filter(|_| t - s.lc_s < super::gps::HOLD_S);
