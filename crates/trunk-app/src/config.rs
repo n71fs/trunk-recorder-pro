@@ -13,7 +13,7 @@ use trunk_core::trunk::{
     check_channels, Access, CallConfig, Protocol, ConvChannel, Talkgroups, ConvConfig, ConvMode, EngineConfig, Identity, SaveRules, SourceConfig,
     SiteConfig, SystemConfig, Talkgroup, UnitTags, UnitTagsMode,
 };
-pub use trunk_core::trunk::{usable_half_width, DEFAULT_GUARD_HZ};
+pub use trunk_core::trunk::{usable_half_width, SiteId, SystemId, DEFAULT_GUARD_HZ};
 use crate::place::{advise, coverage, place_sources, receiver, Advice, Choices, Coverage, Group, Placing, Targets, Weighted};
 use trunk_core::trunk::Pins;
 
@@ -418,8 +418,12 @@ impl Source {
 ///   "sites": [ { "controlChannelsHz": [851012500] },
 ///              { "name": "dcfd-south", "controlChannelsHz": [852337500], "expect": { "rfss": 1, "site": 2 } } ] }
 /// ```
-fn no_id(v: &u32) -> bool {
-    *v == 0
+fn no_site_id(v: &SiteId) -> bool {
+    v.0 == 0
+}
+
+fn no_id(v: &SystemId) -> bool {
+    v.0 == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -428,7 +432,7 @@ pub struct System {
     /// Its number, the same across renames: what the store keeps its calls,
     /// talkgroups and registry by ([`Config::assign_system_ids`]). Never reused.
     #[serde(skip_serializing_if = "no_id")]
-    pub id: u32,
+    pub id: SystemId,
     pub short_name: String,
     /// What people call it ("County Public Safety"); the short name is its folder.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -609,6 +613,10 @@ fn signals_problem(system: &str, defs: &[SignalDef]) -> Option<String> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Site {
+    /// Its number, the same across renames and runs, never another site's
+    /// (any system's): what plugins know it by ([`Config::assign_system_ids`]).
+    #[serde(skip_serializing_if = "no_site_id")]
+    pub id: SiteId,
     /// Its name, unique in its system (empty: the system's short name). The
     /// talkgroup file's Preferred Site names it; calls and plugins say it.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -670,6 +678,10 @@ pub struct Site {
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 fn is_zero_u16(v: &u16) -> bool {
     *v == 0
 }
@@ -761,6 +773,36 @@ choice! {
         Nxdn = "nxdn",
         /// EDACS Standard or Networked (analog and ProVoice voice).
         Edacs = "edacs",
+    }
+}
+
+/// What a kind of system is, beside its name: one table, which the
+/// interface's `web/src/systemKinds.gen.ts` is written from (the test
+/// `the_webs_system_kinds_are_these` keeps it so).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KindInfo {
+    /// As people write it ("SmartNet").
+    pub label: &'static str,
+    /// Its sites are watched whole, every frequency at once (DMR, NXDN,
+    /// EDACS), not followed by one control channel.
+    pub watched: bool,
+    /// The site-lock fields its control channel states ([`SiteIdentity`]'s,
+    /// as the config writes them), which Setup offers as its site lock. (NXDN
+    /// Type-D states none: [`System::site_lock_fields`]. DMR lists none, though
+    /// a site's `expect` in the config file is still checked.)
+    pub site_lock: &'static [&'static str],
+}
+
+impl SystemKind {
+    pub fn info(self) -> KindInfo {
+        match self {
+            SystemKind::P25 => KindInfo { label: "P25", watched: false, site_lock: &["nac", "wacn", "sysId", "rfss", "site"] },
+            SystemKind::Smartnet => KindInfo { label: "SmartNet", watched: false, site_lock: &["sysId", "site"] },
+            // (Sites told apart by colour code, which a site field of its own holds.)
+            SystemKind::Dmr => KindInfo { label: "DMR", watched: true, site_lock: &[] },
+            SystemKind::Nxdn => KindInfo { label: "NXDN", watched: true, site_lock: &["sysId", "site"] },
+            SystemKind::Edacs => KindInfo { label: "EDACS", watched: true, site_lock: &["site"] },
+        }
     }
 }
 
@@ -898,6 +940,12 @@ impl System {
         self.kind == SystemKind::Edacs
     }
 
+    /// The site-lock fields its control channels state ([`KindInfo::site_lock`]):
+    /// its kind's, but none for NXDN Type-D (its repeaters are told apart by RAN).
+    pub fn site_lock_fields(&self) -> &'static [&'static str] {
+        if self.is_nxdn() && self.nxdn_type == NxdnType::TypeD { &[] } else { self.kind.info().site_lock }
+    }
+
     /// Recording it: enabled, with a site that is.
     pub fn active(&self) -> bool {
         self.enabled && self.sites.iter().any(Site::active)
@@ -1002,7 +1050,7 @@ impl Site {
 impl Default for System {
     fn default() -> Self {
         System {
-            id: 0,
+            id: SystemId::default(),
             other: BTreeMap::new(),
             keys: String::new(),
             short_name: "sys1".into(),
@@ -1029,6 +1077,7 @@ impl Default for System {
 impl Default for Site {
     fn default() -> Self {
         Site {
+            id: SiteId::default(),
             name: String::new(),
             directory_id: String::new(),
             enabled: true,
@@ -1077,7 +1126,7 @@ pub use trunk_core::trunk::identity::SiteIdentity;
 pub struct Conventional {
     /// Its number, as a trunked system's ([`System::id`]): numbered together.
     #[serde(skip_serializing_if = "no_id")]
-    pub id: u32,
+    pub id: SystemId,
     /// Folder and record name of its calls (Trunk Recorder's shortName).
     pub short_name: String,
     /// What people call it ("County Fire"); the short name is its folder.
@@ -1149,7 +1198,7 @@ impl UnitNames {
 impl Default for Conventional {
     fn default() -> Self {
         Conventional {
-            id: 0,
+            id: SystemId::default(),
             other: BTreeMap::new(),
             keys: String::new(),
             short_name: "conv".into(),
@@ -1357,6 +1406,27 @@ pub fn keep_p25_numbers(channels: &mut [Channel]) -> usize {
 }
 
 impl Channel {
+    /// A row on `freq_hz` in `mode`, recording anything it hears, named nothing.
+    pub fn new(freq_hz: f64, mode: ConvMode) -> Channel {
+        Channel {
+            freq_hz,
+            mode,
+            name: String::new(),
+            talkgroup: None,
+            code: String::new(),
+            slot: None,
+            match_talkgroup: None,
+            description: String::new(),
+            tag: String::new(),
+            group: String::new(),
+            squelch_db: None,
+            bandwidth_khz: None,
+            enabled: true,
+            receive_on: Vec::new(),
+            auto_tune: false,
+        }
+    }
+
     /// What it records (code, slot and talkgroup), read for its mode.
     pub fn parsed_access(&self) -> Result<Option<Access>, String> {
         Access::join(self.mode, &self.code, self.slot, self.match_talkgroup)
@@ -1560,6 +1630,14 @@ pub struct PluginSetup {
     /// Give it calls decrypted with the recorder's keys (their audio and files). Off: none are.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub share_decrypted: bool,
+    /// The systems it's turned off for: nothing about them is sent to it (one that takes
+    /// every system's figures, `totals`, can't be: [`trunk_recorder_plugin::Manifest::per_system`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub systems_off: Vec<SystemId>,
+    /// The sites it's turned off for (as `systems_off`, by [`SiteId`]): their
+    /// unit events and status aren't sent, nor a recorded call only they heard.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sites_off: Vec<SiteId>,
 }
 
 /// Plugins wait this long for some calls: those its fields pick, each left
@@ -1688,6 +1766,18 @@ pub struct Server {
     /// empty for https://trunkrecorder.pro; another for testing one.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub trp_api: String,
+    /// Who may use the API, on every interface's port: off unless enabled.
+    #[serde(skip_serializing_if = "is_default")]
+    pub auth: Auth,
+    /// Serve HTTPS, on every interface's port: off (plain HTTP) unless set.
+    /// Read as the app starts; a renewed certificate is picked up without a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<Tls>,
+    /// The name this computer is reached by over HTTPS (`radio.tail1234.ts.net`, the one its
+    /// certificate is for): the URLs the recorder logs and opens, and where passkeys work
+    /// besides `localhost` (browsers allow them on no IP address). Empty: none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hostname: String,
     /// Keys this version doesn't know (a newer version's, a hand edit's):
     /// kept, and saved back as they were.
     #[serde(flatten)]
@@ -1696,11 +1786,310 @@ pub struct Server {
 
 impl Default for Server {
     fn default() -> Self {
-        Server { bind: "127.0.0.1".into(), port: 8080, auto_start: false, allowed_origins: vec![], interfaces: BTreeMap::new(), trp_api: String::new(), other: BTreeMap::new() }
+        Server { bind: "127.0.0.1".into(), port: 8080, auto_start: false, allowed_origins: vec![], interfaces: BTreeMap::new(), trp_api: String::new(), auth: Auth::default(), tls: None, hostname: String::new(), other: BTreeMap::new() }
+    }
+}
+
+/// HTTPS: a certificate (its chain, leaf first) and its private key, PEM
+/// files, each absolute, `~/…` or relative to the config file's folder
+/// (`tailscale cert`'s, Let's Encrypt's `fullchain.pem` and `privkey.pem`, mkcert's).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Tls {
+    pub cert: String,
+    pub key: String,
+    /// Tell browsers to come back over HTTPS alone, for a year
+    /// (`Strict-Transport-Security`): every port of this host name, other
+    /// programs' plain HTTP on it too, so off unless set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hsts: bool,
+}
+
+impl Tls {
+    /// Where its certificate and key are, for the config at `config_path`.
+    pub fn paths(&self, config_path: &Path) -> (PathBuf, PathBuf) {
+        let at = |f: &str| {
+            let f = f.trim();
+            match f.strip_prefix("~/") {
+                Some(rest) => home().join(rest),
+                None if Path::new(f).is_absolute() => PathBuf::from(f),
+                None => config_path.parent().unwrap_or(Path::new(".")).join(f),
+            }
+        };
+        (at(&self.cert), at(&self.key))
+    }
+}
+
+/// Signing in to the API: the people and programs who may, each with a role
+/// and what they sign in with (an access token, passkeys). Enabled, a request
+/// gets the lower of its port's access and its user's role (`anonymous`
+/// without one; none: it must sign in); off, its port's alone.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Auth {
+    pub enabled: bool,
+    /// What a request without a user may do (control would be the same as off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anonymous: Option<ApiAccess>,
+    /// Who may sign in, by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub users: BTreeMap<String, AuthUser>,
+    /// Signed in by a reverse proxy in front, which says who in a header: off unless set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<AuthProxy>,
+}
+
+/// A reverse proxy that signs people in itself (Authelia, Authentik,
+/// oauth2-proxy, `tailscale serve`) and says who in `header`: believed from
+/// the addresses in `from` alone. Or Cloudflare Access (`cloudflare`): who
+/// its signed token says, wherever the request comes from (the signature is
+/// the proof; `from` and `header` aren't used). The name it gives is the
+/// recorder's user of that name (or the one `users` maps it to), with their
+/// role; a name that's no user here gets `other` (none: not signed in).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AuthProxy {
+    /// The proxy's addresses: IPs or CIDR blocks ("127.0.0.1", "10.0.0.0/8", "fd7a:115c:a1e0::/48").
+    pub from: Vec<String>,
+    pub header: String,
+    /// Cloudflare Access in front: its token (`Cf-Access-Jwt-Assertion`), checked, says who.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloudflare: Option<AuthCloudflare>,
+    /// The proxy's names for recorder users, where they differ ("luke@example.com": "luke").
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub users: BTreeMap<String, String>,
+    /// What a name that's no user here may do (control is refused).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other: Option<ApiAccess>,
+}
+
+impl Default for AuthProxy {
+    fn default() -> Self {
+        AuthProxy { from: vec![], header: "Remote-User".into(), cloudflare: None, users: BTreeMap::new(), other: None }
+    }
+}
+
+/// Cloudflare Access's application in front: its team (the name, or
+/// `https://<team>.cloudflareaccess.com`), whose keys sign its tokens, and the
+/// application's Audience (AUD) tag, which its tokens are for.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AuthCloudflare {
+    pub team: String,
+    pub aud: String,
+}
+
+impl AuthCloudflare {
+    /// The team's URL, its tokens' issuer (`https://<team>.cloudflareaccess.com`), if `team` is a team name (or that URL).
+    pub fn issuer(&self) -> Option<String> {
+        let t = self.team.trim().to_ascii_lowercase();
+        let t = t.trim_end_matches('/');
+        let name = match t.strip_prefix("https://") {
+            Some(host) => host.strip_suffix(".cloudflareaccess.com")?,
+            None => t,
+        };
+        // (A DNS label: letters, digits and hyphens, not at either end.)
+        let label = !name.is_empty() && name.len() <= 63 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && !name.starts_with('-') && !name.ends_with('-');
+        label.then(|| format!("https://{name}.cloudflareaccess.com"))
+    }
+
+    /// Why it can't be so, if it can't: a team that's no team name, or no Audience tag.
+    fn problem(&self) -> Option<String> {
+        if self.issuer().is_none() {
+            return Some(format!("Cloudflare's team \"{}\" isn't a team name (the part before .cloudflareaccess.com, or that URL).", self.team.trim()));
+        }
+        if self.aud.trim().is_empty() || self.aud.trim().chars().any(char::is_whitespace) {
+            return Some("Cloudflare needs the application's Audience (AUD) tag: its tokens are checked for it.".into());
+        }
+        None
+    }
+}
+
+impl AuthProxy {
+    /// Whether `ip` is one of the proxy's addresses (an IPv4 address as IPv6, `::ffff:a.b.c.d`, as itself).
+    pub fn trusts(&self, ip: std::net::IpAddr) -> bool {
+        self.from.iter().filter_map(|n| net(n).ok()).any(|(base, bits)| in_net(ip.to_canonical(), base, bits))
+    }
+
+    /// Why it can't be so, if it can't: Cloudflare's set as it can't be; else no addresses, one that isn't or a
+    /// block of every address (`0.0.0.0/0`, `::/0`), a header that's no header name; or control for anyone.
+    /// (One that can't be so, written into the config by hand, signs nobody in.)
+    pub fn problem(&self) -> Option<String> {
+        if self.other == Some(ApiAccess::Control) {
+            return Some("Control access for whoever the proxy lets in is the same as signing in turned off: give others listen access or none.".into());
+        }
+        if let Some(cf) = &self.cloudflare {
+            return cf.problem();
+        }
+        if self.from.is_empty() {
+            return Some("The proxy needs its addresses (proxy from): the header is believed from them alone.".into());
+        }
+        if let Some(e) = self.from.iter().find_map(|n| net(n).err()) {
+            return Some(format!("The proxy's addresses: {e}"));
+        }
+        // (Every address: anyone who sends the header is whoever it names.)
+        if let Some(n) = self.from.iter().find(|n| net(n).is_ok_and(|(_, bits)| bits == 0)) {
+            return Some(format!("The proxy's addresses: \"{}\" is every address, so anyone could say who they are: the same as signing in turned off.", n.trim()));
+        }
+        // (RFC 9110's token characters.)
+        if self.header.is_empty() || !self.header.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)) {
+            return Some(format!("The proxy's header \"{}\" isn't a header name (Remote-User, X-Forwarded-User…).", self.header));
+        }
+        None
+    }
+}
+
+/// An address or CIDR block ("10.0.0.0/8", "::1"): its address and how many bits of it count, or why it isn't one.
+fn net(s: &str) -> Result<(std::net::IpAddr, u8), String> {
+    let s = s.trim();
+    let (ip, bits) = match s.split_once('/') {
+        Some((ip, bits)) => (ip, Some(bits)),
+        None => (s, None),
+    };
+    let ip = ip.parse::<std::net::IpAddr>().map_err(|_| format!("\"{s}\" isn't an IP address or CIDR block (\"127.0.0.1\", \"10.0.0.0/8\", \"fd7a:115c:a1e0::/48\")."))?.to_canonical();
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    match bits {
+        None => Ok((ip, max)),
+        Some(b) => b.parse::<u8>().ok().filter(|b| *b <= max).map(|b| (ip, b)).ok_or_else(|| format!("\"{s}\": a block's bits are 0 to {max}.")),
+    }
+}
+
+/// Whether `ip` is in the block of `base`'s first `bits` bits.
+fn in_net(ip: std::net::IpAddr, base: std::net::IpAddr, bits: u8) -> bool {
+    use std::net::IpAddr::{V4, V6};
+    let keep = |width: u32| if bits == 0 { 0 } else { u128::MAX << (width - bits as u32) };
+    match (ip, base) {
+        (V4(a), V4(b)) => (u32::from(a) as u128 ^ u32::from(b) as u128) & keep(32) & u32::MAX as u128 == 0,
+        (V6(a), V6(b)) => (u128::from(a) ^ u128::from(b)) & keep(128) == 0,
+        _ => false,
+    }
+}
+
+/// Someone (or a program) who may sign in: what they may do, and what they
+/// sign in with. With neither a token nor a passkey they can't sign in (yet).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthUser {
+    pub access: ApiAccess,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<AuthToken>,
+    /// Their passkeys, each a device (or password manager) of theirs: added
+    /// by them, signed in, from a browser.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passkeys: Vec<AuthPasskey>,
+}
+
+/// An access token: its secret's SHA-256 (hex), never the secret.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthToken {
+    pub hash: String,
+    /// When it was made, Unix s.
+    #[serde(default)]
+    pub created: i64,
+}
+
+/// A passkey: what it's called, when it was added, its credential id
+/// (base64url) and `key`, WebAuthn's record of it (webauthn-rs's `Passkey`,
+/// as it serializes: its public key, counter and flags; nothing secret), which
+/// the recorder alone reads, as it was added (its count of sign-ins since is
+/// kept beside the config, not here: signing in changes no config).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthPasskey {
+    pub name: String,
+    /// When it was added, Unix s.
+    #[serde(default)]
+    pub created: i64,
+    pub id: String,
+    pub key: serde_json::Value,
+}
+
+impl AuthUser {
+    /// Whether they have anything to sign in with: a token or a passkey.
+    pub fn can_sign_in(&self) -> bool {
+        self.token.is_some() || !self.passkeys.is_empty()
+    }
+}
+
+impl Auth {
+    /// Why it can't be so, if it can't: a proxy set as it can't be (on or
+    /// off); enabled, someone must still be able to turn it off again (a
+    /// control user who can sign in, or whom the proxy can name), and
+    /// anonymous control is off. (Locked out all the same, the proxy gone
+    /// wrong: `trunk-pro access off` on the recorder's computer.)
+    pub fn problem(&self) -> Option<String> {
+        if let Some(why) = self.proxy.as_ref().and_then(AuthProxy::problem) {
+            return Some(why);
+        }
+        if !self.enabled {
+            return None;
+        }
+        if self.anonymous == Some(ApiAccess::Control) {
+            return Some("Anonymous control access is the same as signing in turned off: give anonymous listen access or none.".into());
+        }
+        if !self.users.values().any(|u| u.access == ApiAccess::Control && (u.can_sign_in() || self.proxy.is_some())) {
+            return Some("Signing in needs a user with control access and an access token (or a passkey, or a proxy that signs them in) first, or nobody could turn it off again.".into());
+        }
+        None
+    }
+
+    /// Who the proxy's name `asserted` is here, and what they may do: the
+    /// user it's mapped to (`proxy.users`), else the user of that name, with
+    /// their role; else, by its own name, `proxy.other`'s. None: no proxy, or
+    /// nothing for them.
+    pub fn proxied(&self, asserted: &str) -> Option<(String, ApiAccess)> {
+        let p = self.proxy.as_ref()?;
+        let name = p.users.get(asserted).map_or(asserted, String::as_str);
+        match self.users.get(name) {
+            Some(u) => Some((name.to_string(), u.access)),
+            None => Some((asserted.to_string(), p.other?)),
+        }
     }
 }
 
 impl Server {
+    /// "https" with `tls` set, else "http": its interfaces' URLs.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls.is_some() { "https" } else { "http" }
+    }
+
+    /// `hostname` as a host name is compared (trimmed, lowercase, no final dot, no port), if set.
+    pub fn host(&self) -> Option<String> {
+        let (name, _) = self.hostname_parts();
+        let h = name.trim_end_matches('.').to_ascii_lowercase();
+        (!h.is_empty()).then_some(h)
+    }
+
+    /// The port written in `hostname` ("radio.example.com:8443": where the
+    /// dashboard is reached, a proxy's port in front), if one is.
+    pub fn host_port(&self) -> Option<u16> {
+        self.hostname_parts().1
+    }
+
+    fn hostname_parts(&self) -> (&str, Option<u16>) {
+        let h = self.hostname.trim();
+        match h.rsplit_once(':') {
+            Some((name, port)) => match port.parse::<u16>() {
+                Ok(p) if p > 0 => (name, Some(p)),
+                _ => (name, None),
+            },
+            None => (h, None),
+        }
+    }
+
+    /// The host name of the URLs its ports are at, when it listens on `bind`:
+    /// `hostname`, else localhost for all addresses or the loopback one, else
+    /// the address.
+    pub fn url_host(&self, bind: &str) -> String {
+        match bind.trim().parse::<std::net::IpAddr>() {
+            _ if self.host().is_some() => self.host().unwrap_or_default(),
+            Ok(ip) if ip.is_unspecified() || ip.is_loopback() => "localhost".into(),
+            Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+            _ => bind.trim().to_string(),
+        }
+    }
+
     /// The trunkrecorder.pro API's base URL (no trailing slash).
     pub fn trp_api_base(&self) -> &str {
         let t = self.trp_api.trim().trim_end_matches('/');
@@ -1801,6 +2190,8 @@ pub const RTL_DEFAULT_GAIN_DB: f64 = 25.4;
 pub struct CallSystem<'a> {
     /// The number its calls carry (`Call::system`).
     pub index: u16,
+    /// Its number in the config: what's kept of it goes by.
+    pub id: SystemId,
     pub short_name: &'a str,
     /// "p25", "smartnet", "dmr", "nxdn", "edacs" or "conventional".
     pub kind: &'static str,
@@ -1849,8 +2240,11 @@ pub struct Config {
     pub conventional: Vec<Conventional>,
     /// The next system id to give ([`Config::assign_system_ids`]): above every
     /// one given, so a removed system's id is never given again.
-    #[serde(skip_serializing_if = "no_id")]
+    #[serde(skip_serializing_if = "is_zero_u32")]
     pub next_system_id: u32,
+    /// The next site id to give, as [`Config::next_system_id`] (any system's sites).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub next_site_id: u32,
     pub recording: Recording,
     pub server: Server,
     /// The plugins, by id: on or off, and their settings for the whole recorder.
@@ -1951,6 +2345,7 @@ impl Default for Config {
             systems: vec![],
             conventional: vec![],
             next_system_id: 0,
+            next_site_id: 0,
             recording: Recording::default(),
             server: Server::default(),
             plugins: BTreeMap::new(),
@@ -2215,14 +2610,36 @@ impl Config {
 
     /// Give every system (trunked and conventional) without an id the next
     /// one, and a second with the same id one of its own; [`Config::next_system_id`]
-    /// stays above them all, so an id is never given twice.
-    /// Whether any was given one.
+    /// stays above them all, so an id is never given twice. Sites the same,
+    /// from [`Config::next_site_id`]. Whether any was given one.
     pub fn assign_system_ids(&mut self) -> bool {
-        let given = self.systems.iter().map(|s| s.id).chain(self.conventional.iter().map(|c| c.id)).max().unwrap_or(0);
+        let sites = self.assign_site_ids();
+        self.assign_ids_of_systems() || sites
+    }
+
+    fn assign_site_ids(&mut self) -> bool {
+        let given = self.systems.iter().flat_map(|s| &s.sites).map(|s| s.id.0).max().unwrap_or(0);
+        let mut next = self.next_site_id.max(given + 1);
+        let mut seen = std::collections::HashSet::new();
+        let mut any = false;
+        for id in self.systems.iter_mut().flat_map(|s| &mut s.sites).map(|s| &mut s.id.0) {
+            if *id == 0 || !seen.insert(*id) {
+                *id = next;
+                seen.insert(next);
+                next += 1;
+                any = true;
+            }
+        }
+        self.next_site_id = next;
+        any
+    }
+
+    fn assign_ids_of_systems(&mut self) -> bool {
+        let given = self.systems.iter().map(|s| s.id.0).chain(self.conventional.iter().map(|c| c.id.0)).max().unwrap_or(0);
         let mut next = self.next_system_id.max(given + 1);
         let mut seen = std::collections::HashSet::new();
         let mut given = false;
-        for id in self.systems.iter_mut().map(|s| &mut s.id).chain(self.conventional.iter_mut().map(|c| &mut c.id)) {
+        for id in self.systems.iter_mut().map(|s| &mut s.id.0).chain(self.conventional.iter_mut().map(|c| &mut c.id.0)) {
             if *id == 0 || !seen.insert(*id) {
                 *id = next;
                 seen.insert(next);
@@ -2234,8 +2651,14 @@ impl Config {
         given
     }
 
+    /// The id of the system (trunked or conventional) named `short_name` now:
+    /// how a name given from outside (the interface, a plugin) is resolved.
+    pub fn id_of(&self, short_name: &str) -> Option<SystemId> {
+        self.system_ids().find(|(_, n)| *n == short_name).map(|(id, _)| id)
+    }
+
     /// Each system's id and short name (trunked, then conventional).
-    pub fn system_ids(&self) -> impl Iterator<Item = (u32, &str)> {
+    pub fn system_ids(&self) -> impl Iterator<Item = (SystemId, &str)> {
         self.systems.iter().map(|s| (s.id, s.short_name.as_str())).chain(self.conventional.iter().map(|c| (c.id, c.short_name.as_str())))
     }
 
@@ -2412,12 +2835,12 @@ impl Config {
     /// ([`ConvChannel::names_ahead`]), by system short name: the dashboard's
     /// names for them, ahead of the system's talkgroups', as a call's are. (A
     /// number that comes from the air is named by the calls that carry it.)
-    pub fn row_talkgroups(&self) -> HashMap<String, Talkgroups> {
-        let names: Vec<&str> = self.active_systems().map(|s| s.short_name.as_str()).chain(self.active_conventional().map(|v| v.short_name.as_str())).collect();
-        let mut out: HashMap<String, Talkgroups> = HashMap::new();
+    pub fn row_talkgroups(&self) -> HashMap<SystemId, Talkgroups> {
+        let ids: Vec<SystemId> = self.call_systems().iter().map(|s| s.id).collect();
+        let mut out: HashMap<SystemId, Talkgroups> = HashMap::new();
         for c in self.engine_channels() {
-            if let (Some(t), Some(name)) = (c.names_ahead(), names.get(c.system)) {
-                out.entry(name.to_string()).or_default().entry(t.number).or_insert_with(|| t.clone());
+            if let (Some(t), Some(id)) = (c.names_ahead(), ids.get(c.system)) {
+                out.entry(*id).or_default().entry(t.number).or_insert_with(|| t.clone());
             }
         }
         out
@@ -2542,7 +2965,7 @@ impl Config {
         };
         let mut groups: Vec<Group> = self
             .active_sites()
-            .map(|(sys, s)| group(s.control_channels_hz.iter().copied().chain(s.watched_channels(sys)).collect(), sys.is_dmr() || sys.is_nxdn() || sys.is_edacs(), &s.voice_channels_hz, &sys.receive_on))
+            .map(|(sys, s)| group(s.control_channels_hz.iter().copied().chain(s.watched_channels(sys)).collect(), sys.kind.info().watched, &s.voice_channels_hz, &sys.receive_on))
             .collect();
         for v in self.conventional.iter().filter(|v| v.enabled) {
             let rows: Vec<&Channel> = v.channels.iter().filter(|c| c.enabled && c.freq_hz > 0.0).collect();
@@ -2639,6 +3062,10 @@ impl Config {
             if let Some(site) = sys.sites.iter().find(|x| !seen.insert(sys.site_name(x))) {
                 return Some(format!("Two sites of {} are named \"{}\" — each needs a name of its own.", sys.short_name, sys.site_name(site)));
             }
+            // Nor another system's short name: what was kept under a site's name is still read as its system's (migrate::old_names).
+            if let Some(n) = sys.sites.iter().map(|x| sys.site_name(x)).find(|n| *n != sys.short_name && names.contains(n)) {
+                return Some(format!("A site of {} is named \"{n}\", which is another system's short name — one of them needs another name.", sys.short_name));
+            }
         }
         None
     }
@@ -2723,7 +3150,7 @@ impl Config {
                     return Some(format!("{name}: {e}"));
                 }
             }
-            if sys.is_dmr() || sys.is_nxdn() || sys.is_edacs() {
+            if sys.kind.info().watched {
                 let out: Vec<String> = g.need_missed.iter().map(|f| format!("{:.5}", f / 1e6)).collect();
                 if !out.is_empty() {
                     let what = if sys.is_dmr() { "DMR" } else if sys.is_nxdn() { "NXDN" } else { "EDACS" };
@@ -2789,12 +3216,12 @@ impl Config {
     /// conventional ones. The one place that number is worked out for a
     /// config — the engine, plugins, status and the interface all go by it.
     pub fn call_systems(&self) -> Vec<CallSystem<'_>> {
-        let trunked = self.active_systems().map(|s| (&s.short_name, s.kind.name(), &s.recording, &s.plugins, &s.plugin_delays[..]));
-        let conventional = self.active_conventional().map(|c| (&c.short_name, "conventional", &c.recording, &c.plugins, &c.plugin_delays[..]));
+        let trunked = self.active_systems().map(|s| (s.id, &s.short_name, s.kind.name(), &s.recording, &s.plugins, &s.plugin_delays[..]));
+        let conventional = self.active_conventional().map(|c| (c.id, &c.short_name, "conventional", &c.recording, &c.plugins, &c.plugin_delays[..]));
         trunked
             .chain(conventional)
             .enumerate()
-            .map(|(i, (short_name, kind, recording, plugins, plugin_delays))| CallSystem { index: i as u16, short_name, kind, recording, plugins, plugin_delays })
+            .map(|(i, (id, short_name, kind, recording, plugins, plugin_delays))| CallSystem { index: i as u16, id, short_name, kind, recording, plugins, plugin_delays })
             .collect()
     }
 
@@ -2805,8 +3232,8 @@ impl Config {
 
     /// The engine's config, with each system's talkgroups (kept apart from the config).
     pub fn engine_config(&self, epoch_ms: f64, names: &NameLists) -> EngineConfig {
-        let tg = |short: &str| names.get(short).map_or_else(Default::default, |n| talkgroups_of(&n.talkgroups));
-        let units = |short: &str, u: &UnitNames| UnitTags::new(names.get(short).map_or(&[][..], |n| &n.unit_names), u.mode.engine());
+        let tg = |id: SystemId| names.get(&id).map_or_else(Default::default, |n| talkgroups_of(&n.talkgroups));
+        let units = |id: SystemId, u: &UnitNames| UnitTags::new(names.get(&id).map_or(&[][..], |n| &n.unit_names), u.mode.engine());
         let centers = self.resolved_centers();
         // (Keys are read by the app: [`Config::load_keys`].)
         let mut systems: Vec<SystemConfig> = self
@@ -2815,13 +3242,14 @@ impl Config {
                 let rules = self.recording.with(&sys.recording);
                 let sites = sys
                     .active_sites()
-                    .map(|s| SiteConfig { name: sys.site_name(s).to_string(), control_channels: s.control_channels_hz.clone(), bank: s.bank(), expect: Identity::of_site(&s.expect), protocol: s.protocol(sys) })
+                    .map(|s| SiteConfig { id: s.id, name: sys.site_name(s).to_string(), control_channels: s.control_channels_hz.clone(), bank: s.bank(), expect: Identity::of_site(&s.expect), protocol: s.protocol(sys) })
                     .collect();
                 SystemConfig {
+                    id: sys.id,
                     calls: rules.call_config(),
                     save: rules.save_rules(),
-                    talkgroups: tg(&sys.short_name),
-                    unit_tags: units(&sys.short_name, &sys.unit_names),
+                    talkgroups: tg(sys.id),
+                    unit_tags: units(sys.id, &sys.unit_names),
                     signals: engine_signals(&sys.signals),
                     pins: self.pins(&sys.receive_on),
                     preferred_site: sys.preferred_site.clone(),
@@ -2835,10 +3263,11 @@ impl Config {
         for v in self.active_conventional() {
             let r = self.recording.with(&v.recording);
             systems.push(SystemConfig {
+                id: v.id,
                 calls: r.call_config(),
                 save: r.save_rules(),
-                talkgroups: tg(&v.short_name),
-                unit_tags: units(&v.short_name, &v.unit_names),
+                talkgroups: tg(v.id),
+                unit_tags: units(v.id, &v.unit_names),
                 signals: engine_signals(&v.signals),
                 ..SystemConfig::conventional(&v.short_name)
             });
@@ -2977,22 +3406,22 @@ impl SystemNames {
     }
 }
 
-/// Each system's names ([`SystemNames`]), by its short name.
-pub type NameLists = BTreeMap<String, SystemNames>;
+/// Each system's names ([`SystemNames`]), by its id: a rename keeps them.
+pub type NameLists = BTreeMap<SystemId, SystemNames>;
 
 /// `lists` with system `system`'s names, as `edit` leaves them: a system with none left has no entry.
-pub fn edit_names<T>(lists: &mut NameLists, system: &str, edit: impl FnOnce(&mut SystemNames) -> T) -> T {
-    let names = lists.entry(system.to_string()).or_default();
+pub fn edit_names<T>(lists: &mut NameLists, system: SystemId, edit: impl FnOnce(&mut SystemNames) -> T) -> T {
+    let names = lists.entry(system).or_default();
     let out = edit(names);
     if names.is_empty() {
-        lists.remove(system);
+        lists.remove(&system);
     }
     out
 }
 
 /// Talkgroups only, as [`NameLists`] (tests and examples).
-pub fn talkgroup_lists<'a>(lists: impl IntoIterator<Item = (&'a str, Vec<trunk_core::trunk::TalkgroupRow>)>) -> NameLists {
-    lists.into_iter().map(|(n, talkgroups)| (n.to_string(), SystemNames { talkgroups, ..Default::default() })).collect()
+pub fn talkgroup_lists(lists: impl IntoIterator<Item = (SystemId, Vec<trunk_core::trunk::TalkgroupRow>)>) -> NameLists {
+    lists.into_iter().map(|(id, talkgroups)| (id, SystemNames { talkgroups, ..Default::default() })).collect()
 }
 
 /// A system's talkgroups as the engine looks them up, by number.
@@ -3006,9 +3435,33 @@ pub fn talkgroups_path(dir: &Path, short_name: &str) -> PathBuf {
     dir.join(format!("{short_name}.talkgroups.csv"))
 }
 
+/// The interface's table of system kinds (`web/src/systemKinds.gen.ts`), from [`SystemKind::info`].
+#[cfg(test)]
+fn system_kinds_ts() -> String {
+    let mut ts = String::from("// Written from the recorder's table (trunk-app config.rs, SystemKind::info): don't edit.\n// `TRP_WRITE=1 cargo test -p trunk-app the_webs_system_kinds_are_these` writes it again.\n\n/** What each kind of system is, beside its name. */\nexport const SYSTEM_KINDS = {\n");
+    for k in SystemKind::ALL {
+        let i = k.info();
+        let lock: Vec<String> = i.site_lock.iter().map(|f| format!("\"{f}\"")).collect();
+        ts += &format!("  {}: {{ label: \"{}\", watched: {}, siteLock: [{}] }},\n", k.name(), i.label, i.watched, lock.join(", "));
+    }
+    ts += "} as const;\n\nexport type SystemKind = keyof typeof SYSTEM_KINDS;\n";
+    ts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interface's table of system kinds is this one's (`TRP_WRITE=1` writes it).
+    #[test]
+    fn the_webs_system_kinds_are_these() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/src/systemKinds.gen.ts");
+        let ts = system_kinds_ts();
+        if std::env::var_os("TRP_WRITE").is_some() {
+            std::fs::write(&path, &ts).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap_or_default(), ts, "web/src/systemKinds.gen.ts is out of date: TRP_WRITE=1 cargo test -p trunk-app the_webs_system_kinds_are_these");
+    }
 
     /// Every system gets an id the first time a config is read or set, a
     /// second with the same id one of its own, and an id is never given
@@ -3016,13 +3469,13 @@ mod tests {
     #[test]
     fn systems_get_ids_never_given_twice() {
         let mut c = Config::from_json(r#"{"systems":[{"shortName":"a"},{"shortName":"b","id":7}],"conventional":[{"shortName":"c"}]}"#).unwrap();
-        assert_eq!(c.system_ids().collect::<Vec<_>>(), [(8, "a"), (7, "b"), (9, "c")]);
+        assert_eq!(c.system_ids().collect::<Vec<_>>(), [(SystemId(8), "a"), (SystemId(7), "b"), (SystemId(9), "c")]);
         assert_eq!(c.next_system_id, 10);
         c.systems.remove(1);
         c.systems.push(System { short_name: "d".into(), ..Default::default() });
-        c.conventional[0].id = 8;
+        c.conventional[0].id = SystemId(8);
         c.assign_system_ids();
-        assert_eq!(c.system_ids().collect::<Vec<_>>(), [(8, "a"), (10, "d"), (11, "c")], "a new one past the removed 7; a copied id made its own");
+        assert_eq!(c.system_ids().collect::<Vec<_>>(), [(SystemId(8), "a"), (SystemId(10), "d"), (SystemId(11), "c")], "a new one past the removed 7; a copied id made its own");
         let saved = serde_json::to_value(&c).unwrap();
         assert_eq!((saved["systems"][0]["id"].as_u64(), saved["nextSystemId"].as_u64()), (Some(8), Some(12)));
     }
@@ -3258,7 +3711,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let files = talkgroup_lists([("county", trunk_core::trunk::parse_rows("1,County TG\n")), ("fire", trunk_core::trunk::parse_rows("7,Fire Ops\n"))]);
+        let mut c = c;
+        c.assign_system_ids();
+        let files = talkgroup_lists([(c.id_of("county").unwrap(), trunk_core::trunk::parse_rows("1,County TG\n")), (c.id_of("fire").unwrap(), trunk_core::trunk::parse_rows("7,Fire Ops\n"))]);
         let e = c.engine_config(0.0, &files);
         let fire = e.systems.iter().find(|s| s.short_name == "fire").unwrap();
         assert!(fire.talkgroups.contains_key(&7) && !fire.talkgroups.contains_key(&1), "its own, not county's");
@@ -3280,8 +3735,11 @@ mod tests {
             }"#,
         )
         .unwrap();
+        let mut c = c;
+        c.assign_system_ids();
+        let town_id = c.id_of("town").unwrap();
         let rows = c.row_talkgroups();
-        let town = &rows["town"];
+        let town = &rows[&town_id];
         let mut named: Vec<(u32, &str)> = town.values().map(|t| (t.number, t.alpha_tag.as_str())).collect();
         named.sort();
         // The analog row's default and the P25 row's TG Number; not the catch-all (its numbers come from the air), nor a row without names.
@@ -3289,11 +3747,11 @@ mod tests {
         assert_eq!(town[&46012].tag, "Law Dispatch");
         // Ahead of the talkgroup file, whose Ignore flag stays.
         let mut book = crate::stats::NameBook::default();
-        let files = talkgroup_lists([("town", trunk_core::trunk::parse_rows("46012,File name\n9,Nine,,,,,,,true\n"))]);
+        let files = talkgroup_lists([(town_id, trunk_core::trunk::parse_rows("46012,File name\n9,Nine,,,,,,,true\n"))]);
         book.set_config(&c, &files);
-        assert_eq!(book.tg("town", 46012).map(|t| t.alpha_tag), Some("Townville PD".into()));
-        assert_eq!(book.tg("town", 154430).map(|t| t.alpha_tag), Some("Fire Dispatch".into()));
-        assert!(book.tg("town", 7).is_none());
+        assert_eq!(book.tg(town_id, 46012).map(|t| t.alpha_tag), Some("Townville PD".into()));
+        assert_eq!(book.tg(town_id, 154430).map(|t| t.alpha_tag), Some("Fire Dispatch".into()));
+        assert!(book.tg(town_id, 7).is_none());
     }
 
     #[test]
@@ -3594,6 +4052,9 @@ mod tests {
         assert_eq!(sites, [("east", "east", true), ("east", "east-2", true), ("west", "west", false)]);
         c.systems[0].sites[1].name = "east".into();
         assert!(c.problem().unwrap().contains("Two sites of east are named \"east\""), "{:?}", c.problem());
+        // Nor may a site take another system's short name.
+        c.systems[0].sites[1].name = "west".into();
+        assert!(c.problem().unwrap().contains("A site of east is named \"west\""), "{:?}", c.problem());
         c.systems[0].sites.pop();
         // One source can't hold both.
         c.sources.pop();
@@ -3780,6 +4241,166 @@ mod tests {
         assert_eq!(c.server.interfaces["city"].access, ApiAccess::Control);
         let saved = serde_json::to_string(&c).unwrap();
         assert!(saved.contains(r#""type":"rtlsdr""#) && saved.contains(r#""level":"warning""#) && saved.contains(r#""talkgroupDisplayFormat":"id_tag""#) && saved.contains(r#""access":"control""#), "{saved}");
+    }
+
+    /// Signing in off is saved as a config always was; on, it needs a control
+    /// user who can sign in (to turn it off again), and anonymous control is
+    /// no such thing.
+    #[test]
+    fn signing_in_needs_a_way_back_out() {
+        let c = Config::default();
+        assert!(!serde_json::to_string(&c).unwrap().contains("auth"), "off: no auth key");
+        assert_eq!(c.server.auth.problem(), None);
+        let user = |access| AuthUser { access, token: Some(AuthToken { hash: "ab".repeat(32), created: 1_794_000_000 }), passkeys: vec![] };
+        let mut a = Auth { enabled: true, ..Default::default() };
+        assert!(a.problem().unwrap().contains("control"), "nobody at all");
+        a.users.insert("wall".into(), user(ApiAccess::Listen));
+        assert!(a.problem().is_some(), "a listen user can't turn it off");
+        a.users.insert("luke".into(), AuthUser { access: ApiAccess::Control, token: None, passkeys: vec![] });
+        assert!(a.problem().is_some(), "a control user with nothing to sign in with can't either");
+        let passkey = AuthPasskey { name: "iPhone".into(), created: 1_794_000_000, id: "AQID".into(), key: serde_json::json!({ "cred": {} }) };
+        a.users.get_mut("luke").unwrap().passkeys.push(passkey.clone());
+        assert!(a.users["luke"].can_sign_in() && a.problem().is_none(), "a passkey alone will do");
+        a.users.insert("luke".into(), user(ApiAccess::Control));
+        assert_eq!(a.problem(), None);
+        a.anonymous = Some(ApiAccess::Listen);
+        assert_eq!(a.problem(), None);
+        a.anonymous = Some(ApiAccess::Control);
+        assert!(a.problem().unwrap().contains("nonymous"));
+        assert_eq!(Auth { enabled: false, ..a.clone() }.problem(), None, "off, anything goes");
+        let c = Config::from_json(r#"{ "server": { "auth": { "enabled": true, "anonymous": "listen", "users": { "luke": { "access": "control", "token": { "hash": "00", "created": 1794000000 } }, "wall": { "access": "listen" } } } } }"#).unwrap();
+        assert_eq!((c.server.auth.anonymous, c.server.auth.users["luke"].access, c.server.auth.users["wall"].token.is_none()), (Some(ApiAccess::Listen), ApiAccess::Control, true));
+        assert!(serde_json::to_string(&c).unwrap().contains(r#""auth":{"enabled":true,"anonymous":"listen","users":{"luke":{"access":"control","token":{"hash":"00","created":1794000000}},"wall":{"access":"listen"}}}"#), "no passkeys: no passkeys key");
+        // Passkeys, saved as they were read (the key as webauthn-rs wrote it).
+        let mut c = c;
+        c.server.auth.users.get_mut("wall").unwrap().passkeys.push(passkey);
+        let saved = serde_json::to_string(&c).unwrap();
+        assert!(saved.contains(r#""wall":{"access":"listen","passkeys":[{"name":"iPhone","created":1794000000,"id":"AQID","key":{"cred":{}}}]}"#), "{saved}");
+        assert_eq!(Config::from_json(&saved).unwrap().server.auth, c.server.auth);
+    }
+
+    /// A proxy that signs people in: believed from its addresses alone (IPs
+    /// and CIDR blocks, v4 and v6; one that's neither, or every address,
+    /// refused, signing in on or off); its names are users' (or mapped to them), else `other`'s; a
+    /// control user it can name is a way back in, needing no token.
+    #[test]
+    fn a_proxy_names_users_from_its_addresses() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let p = AuthProxy { from: vec!["127.0.0.1".into(), " 10.1.0.0/16".into(), "fd7a:115c:a1e0::/48".into(), "0.0.0.0/1".into()], ..Default::default() };
+        assert_eq!(p.header, "Remote-User", "Authelia's and Authentik's, by default");
+        let only = |n: &str| AuthProxy { from: vec![n.into()], ..Default::default() };
+        assert!(only("127.0.0.1").trusts(ip("127.0.0.1")) && !only("127.0.0.1").trusts(ip("127.0.0.2")));
+        assert!(only("127.0.0.1").trusts(ip("::ffff:127.0.0.1")), "an IPv4 address as IPv6 (bound to ::)");
+        assert!(only("10.1.0.0/16").trusts(ip("10.1.255.3")) && !only("10.1.0.0/16").trusts(ip("10.2.0.1")));
+        assert!(only("fd7a:115c:a1e0::/48").trusts(ip("fd7a:115c:a1e0:ab12::1")) && !only("fd7a:115c:a1e0::/48").trusts(ip("fd7a:115c:a1e1::1")));
+        assert!(only("::1").trusts(ip("::1")) && !only("::1").trusts(ip("127.0.0.1")), "v6 isn't v4");
+        assert!(only("0.0.0.0/0").trusts(ip("8.8.8.8")) && !only("0.0.0.0/0").trusts(ip("::2")), "/0: every v4 address");
+        assert!(only("10.1.2.3/32").trusts(ip("10.1.2.3")) && !only("10.1.2.3/31").trusts(ip("10.1.2.4")));
+        assert_eq!(p.problem(), None);
+        for (bad, says) in [("10.0.0.0/33", "0 to 32"), ("::/129", "0 to 128"),("radiobox.local", "isn't an IP"), ("10.0.0.0/", "bits"), ("10.0.0/8", "isn't an IP"), ("1.2.3.4/x", "bits")] {
+            let why = AuthProxy { from: vec!["127.0.0.1".into(), bad.into()], ..Default::default() }.problem().unwrap_or_default();
+            assert!(why.contains(bad.trim()) && why.contains(says), "{bad}: {why}");
+            assert!(!only(bad).trusts(ip("10.0.0.1")), "{bad}: nobody");
+        }
+        assert!(AuthProxy::default().problem().unwrap().contains("addresses"), "no addresses");
+        for every in ["0.0.0.0/0", " ::/0", "10.0.0.0/0"] {
+            let why = AuthProxy { from: vec!["127.0.0.1".into(), every.into()], ..Default::default() }.problem().unwrap_or_default();
+            assert!(why.contains(every.trim()) && why.contains("every address") && why.contains("turned off"), "{every}: the same as signing in off: {why}");
+        }
+        assert!(AuthProxy { header: "Remote User".into(), ..only("::1") }.problem().unwrap().contains("header"));
+        assert!(AuthProxy { header: String::new(), ..only("::1") }.problem().unwrap().contains("header"));
+        assert!(AuthProxy { other: Some(ApiAccess::Control), ..only("::1") }.problem().unwrap().contains("others listen"));
+        // Off, a bad one is refused all the same.
+        let mut a = Auth { proxy: Some(only("nope")), ..Default::default() };
+        assert!(a.problem().unwrap().contains("\"nope\""));
+        // A control user with no token: a way in only through the proxy.
+        a.proxy = Some(only("127.0.0.1"));
+        a.enabled = true;
+        a.users.insert("luke".into(), AuthUser { access: ApiAccess::Control, token: None, passkeys: vec![] });
+        a.users.insert("wall".into(), AuthUser { access: ApiAccess::Listen, token: None, passkeys: vec![] });
+        assert_eq!(a.problem(), None, "the proxy can name luke");
+        assert!(Auth { proxy: None, ..a.clone() }.problem().unwrap().contains("control"), "no proxy: nobody can");
+        a.users.remove("luke");
+        assert!(a.problem().unwrap().contains("control"), "a proxy with nobody with control to name");
+        a.users.insert("luke".into(), AuthUser { access: ApiAccess::Control, token: None, passkeys: vec![] });
+        // Its names: a user's, or mapped to one; else other's, by its own name.
+        a.proxy.as_mut().unwrap().users.insert("luke@example.com".into(), "luke".into());
+        a.proxy.as_mut().unwrap().users.insert("ghost@example.com".into(), "nobody".into());
+        assert_eq!(a.proxied("luke@example.com"), Some(("luke".into(), ApiAccess::Control)));
+        assert_eq!(a.proxied("wall"), Some(("wall".into(), ApiAccess::Listen)), "the same name");
+        assert_eq!((a.proxied("stranger"), a.proxied("ghost@example.com")), (None, None), "other none: nobody");
+        a.proxy.as_mut().unwrap().other = Some(ApiAccess::Listen);
+        assert_eq!(a.proxied("stranger"), Some(("stranger".into(), ApiAccess::Listen)));
+        assert_eq!(a.proxied("ghost@example.com"), Some(("ghost@example.com".into(), ApiAccess::Listen)), "mapped to no user: other's");
+        assert_eq!(Auth { proxy: None, ..a.clone() }.proxied("luke"), None, "no proxy: nobody");
+        // Saved: no proxy key unset; set, what isn't the default alone, read back the same.
+        assert!(!serde_json::to_string(&Auth { enabled: true, ..Default::default() }).unwrap().contains("proxy"));
+        let c = Config::from_json(r#"{ "server": { "auth": { "proxy": { "from": ["127.0.0.1"] } } } }"#).unwrap();
+        assert_eq!(c.server.auth.proxy, Some(only("127.0.0.1")));
+        assert!(serde_json::to_string(&c).unwrap().contains(r#""auth":{"enabled":false,"proxy":{"from":["127.0.0.1"],"header":"Remote-User"}}"#));
+        let c = Config::from_json(r#"{ "server": { "auth": { "proxy": { "from": ["::1"], "header": "Tailscale-User-Login", "users": { "luke@github": "luke" }, "other": "listen" } } } }"#).unwrap();
+        let saved = serde_json::to_string(&c).unwrap();
+        assert!(saved.contains(r#""proxy":{"from":["::1"],"header":"Tailscale-User-Login","users":{"luke@github":"luke"},"other":"listen"}"#), "{saved}");
+        assert_eq!(Config::from_json(&saved).unwrap().server.auth, c.server.auth);
+    }
+
+    /// Cloudflare Access: its team a team name or its URL (the tokens'
+    /// issuer, either way), an Audience tag needed; no addresses needed (its
+    /// signature is the proof); control for others refused as ever.
+    #[test]
+    fn cloudflare_is_a_team_and_an_audience() {
+        let cf = |team: &str, aud: &str| AuthCloudflare { team: team.into(), aud: aud.into() };
+        for team in ["radio", " Radio ", "https://radio.cloudflareaccess.com", "https://RADIO.cloudflareaccess.com/", "my-team-2"] {
+            assert!(cf(team, "a1b2").issuer().is_some_and(|i| i.starts_with("https://") && i.ends_with(".cloudflareaccess.com")), "{team}");
+        }
+        assert_eq!(cf("https://radio.cloudflareaccess.com/", "x").issuer().as_deref(), Some("https://radio.cloudflareaccess.com"));
+        assert_eq!(cf("Radio", "x").issuer().as_deref(), Some("https://radio.cloudflareaccess.com"));
+        for team in ["", "radio.example.com", "https://radio.example.com", "http://radio.cloudflareaccess.com", "-radio", "radio team", "https://.cloudflareaccess.com", &"x".repeat(64)] {
+            assert_eq!(cf(team, "a1b2").issuer(), None, "{team:?}");
+        }
+        let p = |c: AuthCloudflare| AuthProxy { cloudflare: Some(c), ..Default::default() };
+        assert_eq!(p(cf("radio", "a1b2")).problem(), None, "no addresses needed");
+        assert!(p(cf("radio.example.com", "a1b2")).problem().unwrap().contains("team"));
+        assert!(p(cf("radio", " ")).problem().unwrap().contains("Audience"));
+        assert!(AuthProxy { other: Some(ApiAccess::Control), ..p(cf("radio", "a1b2")) }.problem().unwrap().contains("others listen"));
+        let c = Config::from_json(r#"{ "server": { "auth": { "proxy": { "cloudflare": { "team": "radio", "aud": "a1b2" }, "users": { "luke@example.com": "luke" } } } } }"#).unwrap();
+        let saved = serde_json::to_string(&c).unwrap();
+        assert!(saved.contains(r#""proxy":{"from":[],"header":"Remote-User","cloudflare":{"team":"radio","aud":"a1b2"},"users":{"luke@example.com":"luke"}}"#), "{saved}");
+        assert!(!serde_json::to_string(&Config::from_json(r#"{ "server": { "auth": { "proxy": { "from": ["::1"] } } } }"#).unwrap()).unwrap().contains("cloudflare"), "unset: no key");
+    }
+
+    /// HTTPS off is saved as a config always was; on, its two paths, from
+    /// the config's folder unless absolute or `~/…`.
+    #[test]
+    fn https_is_two_files_and_off_unless_set() {
+        let c = Config::from_json(r#"{ "server": { "bind": "0.0.0.0", "port": 8443 } }"#).unwrap();
+        assert_eq!((c.server.tls.as_ref(), c.server.scheme()), (None, "http"));
+        let saved = serde_json::to_string(&c).unwrap();
+        assert!(!saved.contains(r#""tls""#), "off: no tls key");
+        assert_eq!(serde_json::to_string(&Config::from_json(&saved).unwrap()).unwrap(), saved);
+        let c = Config::from_json(r#"{ "server": { "tls": { "cert": "certs/radiobox.crt", "key": "/etc/ssl/radiobox.key" } } }"#).unwrap();
+        assert_eq!(c.server.scheme(), "https");
+        assert!(serde_json::to_string(&c).unwrap().contains(r#""tls":{"cert":"certs/radiobox.crt","key":"/etc/ssl/radiobox.key"}"#));
+        let t = c.server.tls.unwrap();
+        assert_eq!(t.paths(Path::new("/home/luke/trunk-pro/config.json")), (PathBuf::from("/home/luke/trunk-pro/certs/radiobox.crt"), PathBuf::from("/etc/ssl/radiobox.key")));
+        assert_eq!(Tls { cert: "~/c.pem".into(), key: "k.pem".into(), ..Default::default() }.paths(Path::new("config.json")).0, home().join("c.pem"));
+        // HSTS: off unless set, and no key then.
+        assert!(!t.hsts);
+        let c = Config::from_json(r#"{ "server": { "tls": { "cert": "c.pem", "key": "k.pem", "hsts": true } } }"#).unwrap();
+        assert!(c.server.tls.as_ref().unwrap().hsts && serde_json::to_string(&c).unwrap().contains(r#""tls":{"cert":"c.pem","key":"k.pem","hsts":true}"#));
+        // The URLs' host: the host name when set, else localhost for any or the loopback address.
+        let mut s = Server::default();
+        assert_eq!((s.url_host("127.0.0.1"), s.url_host("0.0.0.0"), s.url_host("::1"), s.url_host("192.168.1.5"), s.url_host("fd00::5")), ("localhost".into(), "localhost".into(), "localhost".into(), "192.168.1.5".into(), "[fd00::5]".into()));
+        assert!(!serde_json::to_string(&s).unwrap().contains("hostname"), "none: no hostname key");
+        s.hostname = " Radio.tail1234.ts.net. ".into();
+        assert_eq!(s.url_host("0.0.0.0"), "radio.tail1234.ts.net");
+        assert_eq!((s.host().as_deref(), s.host_port()), (Some("radio.tail1234.ts.net"), None));
+        // With a port: where the dashboard is reached (a proxy in front); the name alone is the host.
+        s.hostname = "Radio.example.com.:8443".into();
+        assert_eq!((s.host().as_deref(), s.host_port(), s.url_host("0.0.0.0")), (Some("radio.example.com"), Some(8443), "radio.example.com".into()));
+        s.hostname = "radio.example.com:0".into();
+        assert_eq!((s.host().as_deref(), s.host_port()), (Some("radio.example.com"), None), "no port 0");
     }
 
     #[test]

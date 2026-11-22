@@ -1,4 +1,4 @@
-//! Hytera short-data applications. See docs/guides/dmr-gps.md for sources,
+//! Hytera short-data applications. See docs/developer/protocols/dmr-gps.md for sources,
 //! capture-based compressed GPS layout, and deliberately limited flag support.
 
 use super::data::Packet;

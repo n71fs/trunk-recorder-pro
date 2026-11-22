@@ -16,7 +16,7 @@ function setup(c: Config): void {
   const none = { available: true, detail: "", devices: [] };
   const greeting: FromRecorder[] = [
     { type: "config", config: c, version: 1 },
-    { type: "hello", version: "test", platform: "test", api: 1, surveyBands: [], capabilities: ["service", "drivers"] },
+    { type: "hello", version: "test", platform: "test", api: 1, access: "control", surveyBands: [], capabilities: ["service", "drivers"] },
     { type: "radios", radios: { usrp: none, airspy: none, hydrasdr: none, bladerf: none, hackrf: { available: true, detail: "built in", devices: [{ serial: "0000a1", label: "HackRF One · SN 0000a1" }] } } },
   ];
   for (const m of greeting) transport.onMessage(m);
@@ -39,6 +39,15 @@ test("Setup: a HackRF's editor has its stages and bias-T, and needs no driver", 
   assert.deepEqual([...lna.matchAll(/value="(\d+)"/g)].map((m) => m[1]), ["0", "8", "16", "24", "32", "40"]);
   const vga = html.match(/<select[^>]*aria-label="VGA \(baseband\) gain"[^>]*>(.*?)<\/select>/)?.[1] ?? "";
   assert.equal([...vga.matchAll(/value="(\d+)"/g)].length, 32);
+});
+
+test("Setup: the browser build offers only the radios it opens (no driver, no HackRF)", () => {
+  const c = defaultConfig();
+  setup(c);
+  const kinds = (html: string) => [...(html.match(/role="radiogroup"[^>]*kind"[^>]*>(.*?)<\/div>/)?.[1] ?? "").matchAll(/role="radio"[^>]*>([^<]+)</g)].map((m) => m[1]);
+  assert.ok(kinds(renderToString(<SourceCard c={c} i={0} />)).includes("HackRF"), "the desktop app");
+  transport.onMessage({ type: "hello", version: "test", platform: "test", api: 1, access: "control", surveyBands: [], capabilities: [] });
+  assert.deepEqual(kinds(renderToString(<SourceCard c={c} i={0} />)), ["RTL-SDR", "Capture file"]);
 });
 
 test("Setup: a USRP's editor offers the wire format", () => {

@@ -2,7 +2,7 @@
 //! create_call_json) so existing tooling reads it, and TR's file base name.
 
 
-pub use trunk_recorder_plugin::{CallRecord, ErrorInterval, FreqEntry, SrcEntry, ToneEntry, TonePattern};
+pub use trunk_recorder_plugin::{CallRecord, ErrorInterval, FreqEntry, SiteRef, SrcEntry, ToneEntry, TonePattern};
 
 use super::calls::{Call, Voice};
 use crate::dsp::inband::signal::{matching, Signal};
@@ -20,8 +20,13 @@ pub struct ConcludeInfo<'a> {
     pub short_name: &'a str,
     /// Its system's kind ([`super::Protocol::kind`], or "conventional").
     pub system_type: &'a str,
-    /// Its site's name (empty: a conventional system's call, which has none).
+    /// Its system's id ([`CallRecord::system_id`]).
+    pub system_id: super::SystemId,
+    /// Its site's name and id (empty, 0: a conventional system's call, which has none).
     pub site: &'a str,
+    pub site_id: super::SiteId,
+    /// Every site it was recorded on, `site` first ([`CallRecord::sites`]).
+    pub sites: &'a [(super::SiteId, String)],
     /// Wall-clock epoch ms at sample-clock time 0.
     pub epoch_ms_at_zero: f64,
     pub audio_seconds: f64,
@@ -44,6 +49,9 @@ pub struct ConcludeInfo<'a> {
     pub reception: Reception,
     /// When the first of its copies began (multi-site; None: its own start).
     pub first_s: Option<f64>,
+    /// What its call is known by: its conversation's id, the first copy's
+    /// (multi-site; None: its own). Its `call_num`.
+    pub call_num: Option<super::CallId>,
 }
 
 /// How strong a call came in: its channel's power while it carried the call,
@@ -198,7 +206,7 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (CallRecord, String) {
     let secs = info.audio_seconds;
     let talker = call.sources.iter().map(|s| s.src).find(|&s| s != 0).unwrap_or(0);
     let record = CallRecord {
-        call_num: call.id as u64,
+        call_num: info.call_num.unwrap_or(call.id) as u64,
         transmission_id: format!("{}-{}-{talker}-{}", info.short_name, call.talkgroup, ms(info.first_s.unwrap_or(call.start_s))),
         freq: call.freq_hz,
         freq_error: info.freq_error_hz as i64,
@@ -249,7 +257,10 @@ pub fn call_record(call: &Call, info: &ConcludeInfo) -> (CallRecord, String) {
         system_type: info.system_type.to_string(),
         voice_mode: call.voice.mode_name().to_string(),
         short_name: info.short_name.to_string(),
+        system_id: info.system_id.0,
         site: info.site.to_string(),
+        site_id: info.site_id.0,
+        sites: info.sites.iter().map(|(id, name)| SiteRef { id: id.0, name: name.clone() }).collect(),
         // Only when patched with another, as Trunk Recorder writes it.
         patched_talkgroups: if super::patches::patched(call.patched_talkgroups.len()) { call.patched_talkgroups.clone() } else { Vec::new() },
         freq_list: vec![FreqEntry {
@@ -432,7 +443,10 @@ mod tests {
         let info = ConcludeInfo {
             short_name: "s",
             system_type: "p25",
+            system_id: Default::default(),
             site: "",
+            site_id: Default::default(),
+            sites: &[],
             epoch_ms_at_zero: 0.0,
             audio_seconds: 1.0,
             errors: &errors,
@@ -446,6 +460,7 @@ mod tests {
             freq_error_hz: 0,
             reception: Reception::default(),
             first_s: None,
+            call_num: None,
         };
         let json = call_record(&call, &info).0.to_json();
         assert!(json.contains("\"src\":7,") && json.matches("\"lat\"").count() == 1, "{json}");
@@ -540,8 +555,13 @@ pub struct SaveContext<'a> {
     pub short_name: &'a str,
     /// Its system's kind ([`super::Protocol::kind`], or "conventional").
     pub system_type: &'a str,
-    /// The site's name (empty: conventional).
+    /// Its system's id.
+    pub system_id: super::SystemId,
+    /// The site's name and id (empty, 0: conventional).
     pub site: &'a str,
+    pub site_id: super::SiteId,
+    /// Every site it was recorded on, `site` first ([`ConcludeInfo::sites`]).
+    pub sites: &'a [(super::SiteId, String)],
     /// Wall clock (Unix ms) at the engine's time 0.
     pub epoch_ms_at_zero: f64,
     /// Its radios' talker aliases, and its unit names file.
@@ -555,6 +575,8 @@ pub struct SaveContext<'a> {
     pub signals: &'a [Signal],
     /// When the first of its copies began (multi-site; None: its own start).
     pub first_s: Option<f64>,
+    /// Its call's id, as the world knows it ([`ConcludeInfo::call_num`]).
+    pub call_num: Option<super::CallId>,
 }
 
 /// The frames as an `.sdr` file when the call's mode has a layout there, else JSON lines.
@@ -605,11 +627,25 @@ pub struct RecordedOn {
     pub source: usize,
 }
 
+/// A recorded call that wasn't saved ([`save_call`]), and what it had.
+#[derive(Clone, Debug)]
+pub struct Unsaved {
+    pub call: Call,
+    /// "silent" (no audio kept) or "short" (less than its system's minimum).
+    pub why: &'static str,
+    /// Seconds of audio, its voice frames and how many were bad: what was left once short and encrypted transmissions were.
+    pub audio_s: f64,
+    pub frames: u64,
+    pub bad_frames: u64,
+    pub on: RecordedOn,
+    pub reception: Reception,
+}
+
 /// A finished call made ready to save: transmissions shorter than its
 /// rules allow left out, its loudness and level set, Trunk Recorder's call
-/// JSON written. `Err(call)` when it isn't kept (silent, or shorter than
-/// its system's minimum).
-pub fn save_call(mut h: Held, cx: &SaveContext) -> Result<Concluded, Call> {
+/// JSON written. `Err` when it isn't kept (silent, or shorter than its
+/// system's minimum).
+pub fn save_call(mut h: Held, cx: &SaveContext) -> Result<Concluded, Unsaved> {
     let rules = &cx.rules;
     // Short transmissions and encrypted ones left out (an encrypted one's
     // "audio" is a few frames vocoded before the cipher was known: noise).
@@ -619,7 +655,8 @@ pub fn save_call(mut h: Held, cx: &SaveContext) -> Result<Concluded, Call> {
     let Recorded { mut audio, frames, inband, reception, .. } = rec;
     let short = (audio.len() as f64) < rules.min_call_s * mbe::SAMPLE_RATE as f64 && !audio.is_empty();
     if (audio.is_empty() && !(rules.keep_silent || call.encrypted && cx.keep_encrypted)) || short {
-        return Err(call);
+        let bad_frames = frames.errors.intervals.iter().map(|i| i.bad_frames as u64).sum();
+        return Err(Unsaved { why: if short { "short" } else { "silent" }, audio_s: audio.len() as f64 / mbe::SAMPLE_RATE as f64, frames: frames.count() as u64, bad_frames, on, reception, call });
     }
     let gain_db = if call.voice.analog() { rules.analog_gain_db } else { rules.digital_gain_db } as f64;
     if rules.normalize {
@@ -632,7 +669,10 @@ pub fn save_call(mut h: Held, cx: &SaveContext) -> Result<Concluded, Call> {
         &ConcludeInfo {
             short_name: cx.short_name,
             system_type: cx.system_type,
+            system_id: cx.system_id,
             site: cx.site,
+            site_id: cx.site_id,
+            sites: cx.sites,
             epoch_ms_at_zero: cx.epoch_ms_at_zero,
             audio_seconds: audio.len() as f64 / mbe::SAMPLE_RATE as f64,
             errors: &frames.errors,
@@ -646,6 +686,7 @@ pub fn save_call(mut h: Held, cx: &SaveContext) -> Result<Concluded, Call> {
             reception,
             freq_error_hz: freq_error_hz.map_or(0, |e| e.round() as i32),
             first_s: cx.first_s,
+            call_num: cx.call_num,
         },
     );
     let frames = frames.captured.filter(|f| !audio.is_empty() && !f.is_empty()).map(|f| capture(&call, &f, audio.len(), freq_error_hz, &reception, cx));

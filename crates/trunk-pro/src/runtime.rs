@@ -6,7 +6,7 @@
 use crate::kept;
 use trunk_app::config::{edit_names, NameLists, SystemNames};
 use trunk_app::protocol::TalkgroupEdit;
-use trunk_core::trunk::{edit_rows, edit_unit_names, replace_rows, NameRow, Origin, TalkgroupRow, UnitNameRow};
+use trunk_core::trunk::{edit_rows, edit_unit_names, replace_rows, NameRow, Origin, SystemId, TalkgroupRow, UnitNameRow};
 use trunk_app::saving::Kind;
 use std::collections::VecDeque;
 use std::fs;
@@ -57,10 +57,9 @@ impl Out {
     pub fn of(m: &ToClient) -> Out {
         match m {
             ToClient::Quit => Out::Quit,
-            ToClient::Config { .. } => {
-                let mut listen = m.to_value();
-                listen["config"] = crate::access::redact_config(listen["config"].take());
-                Out::Config { full: m.to_json(), listen: listen.to_string() }
+            ToClient::Config { config, version } => {
+                let listen = ToClient::Config { config: Box::new(crate::access::view::listen_config(config)), version: *version };
+                Out::Config { full: m.to_json(), listen: listen.to_json() }
             }
             _ if m.audience() == Audience::Control => Out::Control(m.to_json()),
             _ => Out::Text(m.to_json()),
@@ -119,6 +118,8 @@ pub struct Ctx {
     pub db: crate::db::Db,
     /// Signalled by a browser's `quit`.
     pub quit: tokio::sync::Notify,
+    /// The interfaces the config serves changed: the server serves them so ([`crate::interfaces::serve::reconcile`]).
+    pub interfaces_due: tokio::sync::Notify,
     /// The survey's latest snapshot, for browsers that connect meanwhile.
     pub survey_last: Mutex<Option<ToClient>>,
     pub plugins: plugins::manage::Plugins,
@@ -142,12 +143,22 @@ pub struct Ctx {
     pub host_last: Mutex<Option<ToClient>>,
     /// The RAM spool (`recording.ramSpool`), as last opened.
     pub spool: Mutex<Option<Arc<crate::spool::Spool>>>,
+    /// The folders calls are written to, and how writing to them goes ([`crate::folder`]).
+    pub folders: crate::folder::Folders,
     /// The computer's clock, watched (#61): what calls' `clock_off` and the dashboard go by.
     pub clock: Arc<crate::clock::Clock>,
     /// Key containers unlocked from the interface ([`crate::unlock`]).
     pub unlocked: crate::unlock::Unlocked,
     /// Recordings of what the radios receive ([`crate::iq_capture`]).
     pub iq: crate::iq_capture::Captures,
+    /// What browsers' sign-in cookies are signed with ([`crate::access::Sessions`]).
+    pub sessions: crate::access::Sessions,
+    /// Passkey sign-ins and adds started and not yet finished ([`crate::access::passkey`]).
+    pub passkeys: crate::access::passkey::Ceremonies,
+    /// The keys Cloudflare Access's tokens are checked with, as last fetched ([`crate::access::cloudflare`]).
+    pub cloudflare: crate::access::cloudflare::Keys,
+    /// HTTPS, when it's served (`server.tls` as the app started): every port's.
+    pub tls: std::sync::OnceLock<crate::tls::Tls>,
     /// A radio's gain being tuned ([`crate::tune`]), and its last report (for browsers that connect).
     pub tune: crate::tune::Slot,
 }
@@ -160,13 +171,13 @@ pub enum EngineCmd {
     /// What the connected browsers watch changed.
     Topics(trunk_app::stats::Topics),
     /// A system's talkgroups changed (loaded, pasted, edited in Setup).
-    Talkgroups { short_name: String, rows: Vec<TalkgroupRow> },
+    Talkgroups { system: SystemId, rows: Vec<TalkgroupRow> },
     /// One talkgroup of a system's file changed (an Ignore flag set from the dashboard).
-    Talkgroup { short_name: String, number: u32, row: Option<trunk_core::trunk::Talkgroup> },
+    Talkgroup { system: SystemId, number: u32, row: Option<trunk_core::trunk::Talkgroup> },
     /// A system's own names for its radios changed (loaded, or one named on its page).
-    UnitNames { short_name: String, rows: Vec<UnitNameRow> },
+    UnitNames { system: SystemId, rows: Vec<UnitNameRow> },
     /// A system's keys changed (a key container unlocked or locked): calls in progress take them too.
-    Keys { short_name: String, ring: Option<Arc<trunk_core::p25::crypt::Keyring>> },
+    Keys { system: SystemId, ring: Option<Arc<trunk_core::p25::crypt::Keyring>> },
     /// A system's config changed: what sharing uses of it, its switch, directory link and licenses ([`trunk_app::share::sync`]).
     ShareSystem(trunk_app::config::System),
     /// How a system's share went.
@@ -175,7 +186,7 @@ pub enum EngineCmd {
     /// radio registry, as `units` and `registry` say (deleted in Setup →
     /// Data): here, so nothing the session holds of them is saved after.
     /// Answered with the radios and talkgroups the registry forgot.
-    Forget { system: Option<String>, units: bool, registry: bool, done: mpsc::Sender<(usize, usize)> },
+    Forget { system: Option<SystemId>, units: bool, registry: bool, done: mpsc::Sender<(usize, usize)> },
     /// What a capture of the radios keeps of the session.
     IqLive { done: mpsc::Sender<crate::iq_capture::Live> },
     /// The voice channels' tapes that have finished.
@@ -189,6 +200,11 @@ pub enum EngineCmd {
 }
 
 impl Ctx {
+    /// "https" while HTTPS is served, else "http": the URLs of its ports.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls.get().is_some() { "https" } else { "http" }
+    }
+
     /// What the connected browsers watch.
     pub fn topics(&self) -> trunk_app::stats::Topics {
         trunk_app::stats::Topics::new(self.topics.lock().unwrap().keys().cloned())
@@ -268,10 +284,10 @@ impl Ctx {
         publish(&self.hub, p.message());
     }
 
-    /// Start recording with `cfg`, in place of whatever the radios were
+    /// Start recording with the config, in place of whatever the radios were
     /// doing (nothing once quitting). The engine thread reports the phase.
     /// A survey goes on only on a spare radio the new config doesn't use.
-    pub fn begin_recording(self: &Arc<Self>, cfg: Config) -> Result<(), String> {
+    pub fn begin_recording(self: &Arc<Self>) -> Result<(), String> {
         let mut l = self.lifecycle.lock().unwrap();
         if l.quitting {
             return Ok(());
@@ -279,6 +295,8 @@ impl Ctx {
         if let Some(r) = l.recording.take() {
             r.stop();
         }
+        // (Taken once the run before has stopped: an edit made meanwhile is the one run.)
+        let cfg = self.config.lock().unwrap().clone();
         if l.survey.as_ref().is_some_and(|s| s.uses_any(&cfg.sources)) {
             self.end_survey(&mut l);
         }
@@ -445,6 +463,11 @@ impl Ctx {
     /// either list has it, and is held against what it runs with: a gain it
     /// can take live ([`live_gain`]) is set, and the run then has it.
     pub fn live_sources(&self, old: &Config, now: &Config) -> Vec<(usize, Option<Gain>)> {
+        // (No radio changed: nothing to take, and no lock taken. The engine thread edits the config
+        // too, a call sign heard, and Stop waits for it with the lifecycle held.)
+        if (0..now.sources.len()).all(|i| now.same_radio(i, &old.sources).is_some_and(|j| old.sources[j].radio() == now.sources[i].radio())) {
+            return vec![];
+        }
         let l = self.lifecycle.lock().unwrap();
         let Some(r) = l.recording.as_ref().filter(|r| !r.finished()) else { return vec![] };
         let mut run = self.run.lock().unwrap();
@@ -458,6 +481,10 @@ impl Ctx {
                 out.push((i, None));
                 continue;
             };
+            // (The run has it already: a gain the tuner kept.)
+            if run.sources[k].radio() == s.radio() {
+                continue;
+            }
             let gain = live_gain(&run.sources[k], s).zip(r.controls.get(k)).map(|(g, c)| {
                 *c.gain.lock().unwrap() = Some(g);
                 run.sources[k] = s.clone();
@@ -551,11 +578,11 @@ pub fn start(ctx: Arc<Ctx>, mut cfg: Config) -> Result<Runner, String> {
         }
         let n = ring.keys().len();
         log::info!("Key source {}: {n} encryption key{} loaded, for {}", k.name, if n == 1 { "" } else { "s" }, k.systems.join(", "));
-        for s in &k.systems {
-            session.set_keys(s, Some(ring.clone()));
+        for id in k.systems.iter().filter_map(|s| cfg.id_of(s)) {
+            session.set_keys(id, Some(ring.clone()));
         }
     }
-    session.load_units(&|name| kept::read_units(&ctx.db, name));
+    session.load_units(&|id| kept::read_units(&ctx.db, id));
     session.load_heard(&kept::read(&ctx.db, Kind::Heard, "").unwrap_or_default());
     session.load_sharing(&kept::read(&ctx.db, Kind::Sharing, "").unwrap_or_default());
     session.load_tune(&kept::read(&ctx.db, Kind::Tune, "").unwrap_or_default());
@@ -621,10 +648,10 @@ fn warn_readable_keys(ctx: &Ctx, cfg: &Config) {
 pub trait NameList: NameRow + Sized {
     fn of(n: &mut SystemNames) -> &mut Vec<Self>;
     /// Keep system `system`'s, in place of what's kept.
-    fn keep(db: &crate::db::Db, system: &str, rows: Vec<Self>);
+    fn keep(db: &crate::db::Db, system: SystemId, rows: Vec<Self>);
     /// System `system`'s as kept.
-    fn stored(db: &crate::db::Db, system: &str) -> Result<Vec<Self>, String>;
-    fn engine(short_name: String, rows: Vec<Self>) -> EngineCmd;
+    fn stored(db: &crate::db::Db, system: SystemId) -> Result<Vec<Self>, String>;
+    fn engine(system: SystemId, rows: Vec<Self>) -> EngineCmd;
     fn told(system: String, rows: Vec<Self>) -> ToClient;
 }
 
@@ -632,14 +659,14 @@ impl NameList for TalkgroupRow {
     fn of(n: &mut SystemNames) -> &mut Vec<Self> {
         &mut n.talkgroups
     }
-    fn keep(db: &crate::db::Db, system: &str, rows: Vec<Self>) {
+    fn keep(db: &crate::db::Db, system: SystemId, rows: Vec<Self>) {
         kept::write_talkgroups(db, system, rows);
     }
-    fn stored(db: &crate::db::Db, system: &str) -> Result<Vec<Self>, String> {
+    fn stored(db: &crate::db::Db, system: SystemId) -> Result<Vec<Self>, String> {
         db.talkgroups(system)
     }
-    fn engine(short_name: String, rows: Vec<Self>) -> EngineCmd {
-        EngineCmd::Talkgroups { short_name, rows }
+    fn engine(system: SystemId, rows: Vec<Self>) -> EngineCmd {
+        EngineCmd::Talkgroups { system, rows }
     }
     fn told(system: String, talkgroups: Vec<Self>) -> ToClient {
         ToClient::Talkgroups { system, talkgroups }
@@ -650,26 +677,29 @@ impl NameList for UnitNameRow {
     fn of(n: &mut SystemNames) -> &mut Vec<Self> {
         &mut n.unit_names
     }
-    fn keep(db: &crate::db::Db, system: &str, rows: Vec<Self>) {
+    fn keep(db: &crate::db::Db, system: SystemId, rows: Vec<Self>) {
         kept::write_unit_names(db, system, rows);
     }
-    fn stored(db: &crate::db::Db, system: &str) -> Result<Vec<Self>, String> {
+    fn stored(db: &crate::db::Db, system: SystemId) -> Result<Vec<Self>, String> {
         db.unit_names(system)
     }
-    fn engine(short_name: String, rows: Vec<Self>) -> EngineCmd {
-        EngineCmd::UnitNames { short_name, rows }
+    fn engine(system: SystemId, rows: Vec<Self>) -> EngineCmd {
+        EngineCmd::UnitNames { system, rows }
     }
     fn told(system: String, unit_names: Vec<Self>) -> ToClient {
         ToClient::UnitNames { system, unit_names }
     }
 }
 
-/// Why `system` can't be a system's short name the names are kept by.
-fn names_of(system: &str) -> Result<(), String> {
-    if system.trim().is_empty() || system.contains(['/', '\\']) || system.starts_with('.') {
-        return Err(format!("bad short name {system:?}"));
-    }
-    Ok(())
+/// The system named `short_name` in the config now: how a name the
+/// interface gives is resolved. Err: no system has it.
+pub fn system_named(ctx: &Ctx, short_name: &str) -> Result<SystemId, String> {
+    ctx.config.lock().unwrap().id_of(short_name).ok_or_else(|| format!("no system is named {short_name:?}"))
+}
+
+/// System `system`'s short name in the config now ("": gone from it).
+pub fn short_name(ctx: &Ctx, system: SystemId) -> String {
+    ctx.config.lock().unwrap().system_ids().find(|(id, _)| *id == system).map_or_else(String::new, |(_, n)| n.to_string())
 }
 
 /// The names the dashboard answers with follow the names kept (the config
@@ -688,8 +718,7 @@ fn origin_now() -> i64 {
 /// has none): kept, told to every browser, and taken by the recording at
 /// once; written in the background. `from`: where they came from, the
 /// origin of the rows that change ([`replace_rows`]; none: as they come).
-pub fn set_names<R: NameList>(ctx: &Ctx, system: &str, rows: Vec<R>, from: Option<Origin>) -> Result<(), String> {
-    names_of(system)?;
+pub fn set_names<R: NameList>(ctx: &Ctx, system: SystemId, rows: Vec<R>, from: Option<Origin>) -> Result<(), String> {
     let from = from.map(|f| f.at(origin_now()));
     // (Handed to the writer with the lock held: two browsers' edits are written in the order they're kept.)
     let rows = edit_names(&mut ctx.names.lock().unwrap(), system, |n| {
@@ -698,17 +727,16 @@ pub fn set_names<R: NameList>(ctx: &Ctx, system: &str, rows: Vec<R>, from: Optio
         R::keep(&ctx.db, system, list.clone());
         list.clone()
     });
-    ctx.tell_engine(R::engine(system.to_string(), rows.clone()));
+    ctx.tell_engine(R::engine(system, rows.clone()));
     names_changed(ctx);
-    publish(&ctx.hub, R::told(system.to_string(), rows));
+    publish(&ctx.hub, R::told(short_name(ctx, system), rows));
     Ok(())
 }
 
 /// One talkgroup of system `system`'s edited by hand: only the cells `edit`
 /// sets change. Kept, taken by the recording and told to every browser at
 /// once (the row alone, not the list); written in the background.
-pub fn set_talkgroup(ctx: &Ctx, system: &str, number: u32, edit: TalkgroupEdit) -> Result<(), String> {
-    names_of(system)?;
+pub fn set_talkgroup(ctx: &Ctx, system: SystemId, number: u32, edit: TalkgroupEdit) -> Result<(), String> {
     let origin = Origin::edited(origin_now());
     // (Edited and handed to the writer with the lock held: edits are written in the order they're kept.)
     let row = edit_names(&mut ctx.names.lock().unwrap(), system, |n| {
@@ -721,25 +749,24 @@ pub fn set_talkgroup(ctx: &Ctx, system: &str, number: u32, edit: TalkgroupEdit) 
         edited.map(|r| r.tg)
     });
     ctx.shared.names.lock().unwrap().set_talkgroup(system, number, row.clone());
-    ctx.tell_engine(EngineCmd::Talkgroup { short_name: system.to_string(), number, row });
-    publish(&ctx.hub, ToClient::TalkgroupEdited { system: system.to_string(), talkgroup: number, edit, origin });
+    ctx.tell_engine(EngineCmd::Talkgroup { system, number, row });
+    publish(&ctx.hub, ToClient::TalkgroupEdited { system: short_name(ctx, system), talkgroup: number, edit, origin });
     Ok(())
 }
 
 /// Radio `unit` of system `system` named `name` by hand (blank: its own name
 /// taken out): kept, taken by the recording and told to every browser at
 /// once (the name alone); written in the background.
-pub fn set_unit_name(ctx: &Ctx, system: &str, unit: u32, name: String) -> Result<(), String> {
-    names_of(system)?;
+pub fn set_unit_name(ctx: &Ctx, system: SystemId, unit: u32, name: String) -> Result<(), String> {
     let origin = Origin::edited(origin_now());
     let rows = edit_names(&mut ctx.names.lock().unwrap(), system, |n| {
         edit_unit_names(&mut n.unit_names, unit, &name, &origin);
         kept::write_unit_names(&ctx.db, system, n.unit_names.clone());
         n.unit_names.clone()
     });
-    ctx.tell_engine(EngineCmd::UnitNames { short_name: system.to_string(), rows });
+    ctx.tell_engine(EngineCmd::UnitNames { system, rows });
     names_changed(ctx);
-    publish(&ctx.hub, ToClient::UnitNameEdited { system: system.to_string(), unit, name, origin });
+    publish(&ctx.hub, ToClient::UnitNameEdited { system: short_name(ctx, system), unit, name, origin });
     Ok(())
 }
 
@@ -748,16 +775,16 @@ pub fn set_unit_name(ctx: &Ctx, system: &str, unit: u32, name: String) -> Result
 /// the recording's session first, if one is running, so it saves nothing of
 /// them after ([`EngineCmd::Forget`]). The radios and talkgroups the
 /// registry forgot.
-pub fn forget(ctx: &Ctx, system: Option<&str>, units: bool, registry: bool) -> (usize, usize) {
+pub fn forget(ctx: &Ctx, system: Option<SystemId>, units: bool, registry: bool) -> (usize, usize) {
     let (done, answer) = mpsc::channel();
-    let told = ctx.engine.lock().unwrap().as_ref().is_some_and(|tx| tx.send(EngineCmd::Forget { system: system.map(str::to_string), units, registry, done }).is_ok());
+    let told = ctx.engine.lock().unwrap().as_ref().is_some_and(|tx| tx.send(EngineCmd::Forget { system, units, registry, done }).is_ok());
     let by_session = if told { answer.recv_timeout(Duration::from_secs(10)).unwrap_or_default() } else { (0, 0) };
     // (Between runs, or the run ended meanwhile: what outlives it.)
     if units {
         let cfg = ctx.config.lock().unwrap().clone();
         let mut book = ctx.shared.names.lock().unwrap();
-        for n in cfg.systems.iter().map(|s| &s.short_name).chain(cfg.conventional.iter().map(|c| &c.short_name)).filter(|n| system.is_none_or(|s| s == n.as_str())) {
-            book.set_units(n, "");
+        for (id, _) in cfg.system_ids().filter(|(id, _)| system.is_none_or(|s| s == *id)) {
+            book.set_units(id, "");
         }
     }
     let gone = if registry { ctx.shared.radio.lock().unwrap().forget(system) } else { (0, 0) };
@@ -771,8 +798,8 @@ fn save_due(ctx: &Ctx, session: &mut Session, now_ms: f64, all: bool) {
     for saved in session.due(now_ms, all) {
         let (kind, key) = (saved.kind(), saved.key().to_string());
         match saved {
-            Saved::Units { system, csv } => kept::write_units(&ctx.db, &system, &csv),
-            Saved::Registry { system, changes } => kept::write_registry(&ctx.db, &system, changes),
+            Saved::Units { system, csv } => kept::write_units(&ctx.db, system, &csv),
+            Saved::Registry { system, changes } => kept::write_registry(&ctx.db, system, changes),
             Saved::Sharing(text) | Saved::Bandplan { plan: text, .. } | Saved::Heard(text) | Saved::Tune(text) => kept::write(&ctx.db, kind, &key, text),
         }
     }
@@ -784,9 +811,9 @@ fn save_due(ctx: &Ctx, session: &mut Session, now_ms: f64, all: bool) {
 pub fn load_names(shared: &trunk_app::stats::Shared, cfg: &Config, names: &NameLists, db: &crate::db::Db) {
     shared.set_config(cfg, names);
     let mut book = shared.names.lock().unwrap();
-    for n in cfg.systems.iter().map(|s| &s.short_name).chain(cfg.conventional.iter().map(|c| &c.short_name)) {
-        if let Some(csv) = kept::read_units(db, n) {
-            book.set_units(n, &csv);
+    for (id, _) in cfg.system_ids() {
+        if let Some(csv) = kept::read_units(db, id) {
+            book.set_units(id, &csv);
         }
     }
 }
@@ -905,9 +932,10 @@ pub(crate) fn local_offset(t: i64) -> i32 {
 /// off, the one the app made emptied into the recordings folder and removed.
 /// One that can't be made leaves calls going to the recordings folder.
 fn open_spool(ctx: &Ctx, cfg: &Config) {
-    let (want, capture) = (&cfg.recording.ram_spool, Path::new(&cfg.recording.capture_dir));
+    let want = &cfg.recording.ram_spool;
+    ctx.folders.recordings.follow(Path::new(&cfg.recording.capture_dir));
     if !want.enabled || !want.dir.is_empty() {
-        crate::spool::retire(&crate::paths::data_dir(), capture);
+        crate::spool::retire(&crate::paths::data_dir(), &ctx.folders.recordings);
     }
     let spool = if want.enabled {
         match crate::spool::Spool::open(want, &crate::paths::data_dir()) {
@@ -920,6 +948,7 @@ fn open_spool(ctx: &Ctx, cfg: &Config) {
     } else {
         None
     };
+    ctx.folders.spool.follow(spool.as_ref().map_or(Path::new(""), |s| s.dir.as_path()));
     *ctx.spool.lock().unwrap() = spool;
 }
 
@@ -1057,10 +1086,12 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<m
         .collect();
     drop(ctl_tx);
     let dir = PathBuf::from(&cfg.recording.capture_dir);
-    // Each system's file rules, by a call's `system` (trunked or conventional).
+    // Each system's file rules, by a call's `system` (trunked or conventional), and its id as this
+    // run's config has it: what the store files its calls under, a rename meanwhile or not.
     let rules = {
         let (each, all) = (cfg.recordings().iter().map(FileRules::of).collect::<Vec<_>>(), FileRules::of(&cfg.recording));
-        move |system: u16| each.get(system as usize).copied().unwrap_or(all)
+        let ids: Vec<SystemId> = cfg.call_systems().iter().map(|s| s.id).collect();
+        move |system: u16| (each.get(system as usize).copied().unwrap_or(all), ids.get(system as usize).copied())
     };
     let spool = ctx.spool.lock().unwrap().clone();
     let encoder = plugins::Encoder::find(cfg.recording.m4a.encoder).map(|e| (e, cfg.recording.m4a.bitrate_kbps.clamp(8, 320)));
@@ -1118,21 +1149,21 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<m
                 }
                 EngineCmd::Source(_) => {}
                 EngineCmd::Topics(t) => session.set_topics(t),
-                EngineCmd::Talkgroups { short_name, rows } => {
-                    if session.set_talkgroups(&short_name, &rows) {
-                        log::info!("[{short_name}] Talkgroups updated");
+                EngineCmd::Talkgroups { system, rows } => {
+                    if session.set_talkgroups(system, &rows) {
+                        log::info!("[{}] Talkgroups updated", session.short_name(system));
                     }
                 }
-                EngineCmd::Talkgroup { short_name, number, row } => {
-                    session.set_talkgroup(&short_name, number, row);
+                EngineCmd::Talkgroup { system, number, row } => {
+                    session.set_talkgroup(system, number, row);
                 }
-                EngineCmd::UnitNames { short_name, rows } => {
-                    if session.set_unit_names(&short_name, &rows) {
-                        log::info!("[{short_name}] Radio names updated");
+                EngineCmd::UnitNames { system, rows } => {
+                    if session.set_unit_names(system, &rows) {
+                        log::info!("[{}] Radio names updated", session.short_name(system));
                     }
                 }
-                EngineCmd::Keys { short_name, ring } => {
-                    session.set_keys(&short_name, ring);
+                EngineCmd::Keys { system, ring } => {
+                    session.set_keys(system, ring);
                 }
                 EngineCmd::ShareSystem(sys) => {
                     if sys.share {
@@ -1143,9 +1174,9 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<m
                 EngineCmd::Shared { short_name, result } => session.share_done(&short_name, now_ms(), result),
                 EngineCmd::Forget { system, units, registry, done } => {
                     if units {
-                        session.forget_units(system.as_deref());
+                        session.forget_units(system);
                     }
-                    let gone = if registry { ctx.shared.radio.lock().unwrap().forget(system.as_deref()) } else { (0, 0) };
+                    let gone = if registry { ctx.shared.radio.lock().unwrap().forget(system) } else { (0, 0) };
                     let _ = done.send(gone);
                 }
                 EngineCmd::IqLive { done } => {
@@ -1215,6 +1246,8 @@ fn engine_thread(ctx: Arc<Ctx>, cfg: Config, mut session: Session, queues: Vec<m
 struct Finish {
     rel: String,
     system: u16,
+    /// Its system's id (none: not one of the run's config).
+    system_id: Option<SystemId>,
     wav: Vec<u8>,
     record: trunk_recorder_plugin::CallRecord,
     frames: Option<trunk_core::trunk::Capture>,
@@ -1248,7 +1281,7 @@ fn finish_calls(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, rx: 
 fn finish_one(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, mut f: Finish, encoder: Option<&(plugins::Encoder, u32)>) {
     let host = ctx.plugins.host();
     let r = f.rules;
-    let to_plugins = host.as_ref().map_or(Default::default(), |h| h.plugin_audio(f.decrypted));
+    let to_plugins = host.as_ref().map_or(Default::default(), |h| h.plugin_audio(f.system, &f.record, f.decrypted));
     let p = plugins::plan(r, to_plugins, encoder.is_some());
     let (keep_wav, keep_m4a, keep_json, keep_audio) = (p.keep_wav, p.keep_m4a, p.keep_json, p.keep_audio);
     let base = dir.join(&f.rel);
@@ -1258,31 +1291,67 @@ fn finish_one(ctx: &Ctx, dir: &Path, spool: Option<&crate::spool::Spool>, mut f:
     let json = f.record.to_json();
     let need = json.len() + f.wav.len() / 4 + if p.write_wav && !keep_wav { f.wav.len() } else { 0 };
     let spooled = spool.filter(|s| p.spool && s.room_for(need as u64)).map(|s| s.dir.join(&f.rel));
-    let at = |kept: bool, ext: &str| PathBuf::from(format!("{}.{ext}", if kept { &base } else { spooled.as_ref().unwrap_or(&base) }.display()));
-    let (wav_at, json_at, frames_at, m4a_at) = (at(keep_wav, "wav"), at(keep_json, "json"), at(keep_audio, f.frames.as_ref().map_or("sdr", |c| c.ext)), at(keep_m4a, "m4a"));
-    for d in [&wav_at, &json_at, &m4a_at].into_iter().filter_map(|p| p.parent()) {
-        let _ = fs::create_dir_all(d);
-    }
-    let ok = (!p.write_wav || fs::write(&wav_at, &f.wav).is_ok())
-        && (!p.write_json || fs::write(&json_at, &json).is_ok())
-        && f.frames.as_ref().filter(|_| p.write_frames).is_none_or(|c| fs::write(&frames_at, &c.bytes).is_ok());
-    if !ok {
-        log::warn!("Couldn't write {}", base.display());
+    // Each file through the folder it goes to, which says why when one can't
+    // be written (crate::folder); what the spool can't take goes to the
+    // recordings folder (the archive looks in both).
+    let folders = &ctx.folders;
+    let mut spool_ok = spooled.is_some();
+    let at = |b: &Path, ext: &str| PathBuf::from(format!("{}.{ext}", b.display()));
+    let mut put = |kept: bool, ext: &str, bytes: &[u8]| -> Option<PathBuf> {
+        if let Some(s) = spooled.as_ref().filter(|_| !kept && spool_ok) {
+            let p = at(s, ext);
+            if folders.spool.write(&p, bytes).is_ok() {
+                return Some(p);
+            }
+            spool_ok = false;
+        }
+        let p = at(&base, ext);
+        folders.recordings.write(&p, bytes).ok().map(|_| p)
+    };
+    // (The first that fails ends it: the folder says why, once, and counts it.)
+    let written = 'w: {
+        let wav = match p.write_wav.then(|| put(keep_wav, "wav", &f.wav)) {
+            Some(None) => break 'w None,
+            w => w.flatten(),
+        };
+        let json = match p.write_json.then(|| put(keep_json, "json", json.as_bytes())) {
+            Some(None) => break 'w None,
+            j => j.flatten(),
+        };
+        if f.frames.as_ref().filter(|_| p.write_frames).is_some_and(|c| put(keep_audio, c.ext, &c.bytes).is_none()) {
+            break 'w None;
+        }
+        Some((wav, json))
+    };
+    let Some((wav_at, json_at)) = written else {
+        log::debug!("Call {} not saved", f.rel);
         return;
-    }
+    };
+    // Where the rest goes (made later, or not at all): the folder, and the path.
+    let place = |kept: bool, ext: &str| match spooled.as_ref().filter(|_| !kept && spool_ok) {
+        Some(s) => (&folders.spool, at(s, ext)),
+        None => (&folders.recordings, at(&base, ext)),
+    };
+    let (wav_at, json_at) = (wav_at.unwrap_or_else(|| place(keep_wav, "wav").1), json_at.unwrap_or_else(|| place(keep_json, "json").1));
+    let (m4a_folder, m4a_at) = place(keep_m4a, "m4a");
     // Whether its audio and JSON stay once the plugins are done (a plugin's failure may keep them after all: archive::settle).
-    let call = index_call(ctx, &f.rel, &f.record, keep_audio, keep_json);
+    let call = index_call(ctx, f.system_id, &f.rel, &f.record, keep_audio, keep_json);
     publish(&ctx.hub, ToClient::Concluded { entry: serde_json::to_value(&call).unwrap_or_default() });
     let mut wav_written = p.write_wav;
     let mut m4a = None;
     if let Some((e, kbps)) = encoder.filter(|_| p.make_m4a) {
-        match e.m4a(&f.wav, &m4a_at, *kbps) {
+        // (Its folder not made: the folder said why; "" here.)
+        let made = m4a_folder.prepare(&m4a_at).map_err(|_| String::new()).and_then(|_| e.m4a(&f.wav, &m4a_at, *kbps));
+        match made {
             Ok(()) => m4a = Some(m4a_at),
             Err(err) => {
-                m4a_failed(&f.rel, &err);
+                if !err.is_empty() {
+                    m4a_failed(&f.rel, &err);
+                }
                 // The call's audio is then the WAV.
                 if !wav_written {
-                    wav_written = fs::write(&wav_at, &f.wav).is_ok();
+                    let (folder, wav_at) = place(keep_wav, "wav");
+                    wav_written = folder.write(&wav_at, &f.wav).is_ok();
                 }
             }
         }
@@ -1326,7 +1395,7 @@ fn share(ctx: &Arc<Ctx>, short_name: String, observation: serde_json::Value, sit
 }
 
 /// Forward everything to the browsers and plugins; calls go to be stored.
-fn deliver(ctx: &Arc<Ctx>, out: &mut Vec<Output>, plugins: Option<&PluginHost>, rules: &dyn Fn(u16) -> FileRules, finish: &dyn Fn(Finish)) {
+fn deliver(ctx: &Arc<Ctx>, out: &mut Vec<Output>, plugins: Option<&PluginHost>, rules: &dyn Fn(u16) -> (FileRules, Option<SystemId>), finish: &dyn Fn(Finish)) {
     for o in out.drain(..) {
         match o {
             Output::Fact { on, facts } => ctx.iq.fact(crate::iq_rules::Fact { on, facts }),
@@ -1374,22 +1443,25 @@ fn deliver(ctx: &Arc<Ctx>, out: &mut Vec<Output>, plugins: Option<&PluginHost>, 
             }
             Output::File { rel, system, wav, record, frames, decrypted } => {
                 ctx.iq.fact(crate::iq_rules::Fact { on: "call.end", facts: crate::iq_rules::call_facts(&record) });
-                finish(Finish { rel, system, wav, record, frames, rules: rules(system), decrypted })
+                let (rules, system_id) = rules(system);
+                finish(Finish { rel, system, system_id, wav, record, frames, rules, decrypted })
             }
         }
     }
 }
 
-/// A finished call: put at the front of the live list and handed to the
-/// store (`audio` and `json` say what of it is kept so far). Gives the call.
-pub fn index_call(ctx: &Ctx, rel: &str, record: &trunk_recorder_plugin::CallRecord, audio: bool, json: bool) -> StoredCall {
+/// A finished call of system `system` (none: the one its record names now):
+/// put at the front of the live list and handed to the store (`audio` and
+/// `json` say what of it is kept so far). Gives the call.
+pub fn index_call(ctx: &Ctx, system: Option<SystemId>, rel: &str, record: &trunk_recorder_plugin::CallRecord, audio: bool, json: bool) -> StoredCall {
     let call = StoredCall { path: rel.replace('\\', "/"), record: record.clone(), audio, json };
     {
         let mut r = ctx.recent.lock().unwrap();
         r.push_front(call.clone());
         r.truncate(RECENT_KEPT);
     }
-    let row = crate::db::row::call_row(rel, record, audio, json, ctx.db.recorder(), crate::clock::unix_ms() as i64);
+    let mut row = crate::db::row::call_row(rel, record, audio, json, ctx.db.recorder(), crate::clock::unix_ms() as i64);
+    row.system_id = system.map_or(0, i64::from);
     ctx.db.send(Change::Call { row, live: true });
     call
 }
@@ -1726,7 +1798,7 @@ mod finish_tests {
         assert_eq!(names, ["ohmarcs-butler"]);
         let r = crate::db::row::tests::record(9179, 1_700_000_000_000);
         let rel = "ohmarcs/2026/10/26/9179-1700000000_851350000";
-        let entry = index_call(&ctx, rel, &r, true, true);
+        let entry = index_call(&ctx, None, rel, &r, true, true);
         ctx.db.flush().unwrap();
         let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
         assert_eq!(entries.len(), 1);
@@ -1758,25 +1830,26 @@ mod names_tests {
         let ctx = test_ctx(&dir.join("capture"));
         // (A system being recorded: the dashboard names its radios.)
         ctx.config.lock().unwrap().systems[0].sites[0].control_channels_hz = vec![851_012_500.0];
+        let oh = system_named(&ctx, "ohmarcs").unwrap();
         let before = origin_now();
-        set_names(&ctx, "ohmarcs", trunk_core::trunk::parse_rows("Decimal,Alpha Tag\n101,Fire\n102,EMS\n"), Some(Origin { kind: OriginKind::RadioReference, ..Default::default() })).unwrap();
-        let at = |n: usize| ctx.names.lock().unwrap()["ohmarcs"].talkgroups[n].origin.clone().unwrap();
+        set_names(&ctx, oh, trunk_core::trunk::parse_rows("Decimal,Alpha Tag\n101,Fire\n102,EMS\n"), Some(Origin { kind: OriginKind::RadioReference, ..Default::default() })).unwrap();
+        let at = |n: usize| ctx.names.lock().unwrap()[&oh].talkgroups[n].origin.clone().unwrap();
         assert!(at(0).kind == OriginKind::RadioReference && at(0).at >= before, "the recorder's time: {:?}", at(0));
-        set_talkgroup(&ctx, "ohmarcs", 102, TalkgroupEdit { alpha_tag: Some("EMS 2".into()), ..Default::default() }).unwrap();
+        set_talkgroup(&ctx, oh, 102, TalkgroupEdit { alpha_tag: Some("EMS 2".into()), ..Default::default() }).unwrap();
         assert_eq!((at(0).kind, at(1).kind), (OriginKind::RadioReference, OriginKind::Edited));
-        assert_eq!(ctx.shared.names.lock().unwrap().tg("ohmarcs", 102).map(|t| t.alpha_tag), Some("EMS 2".into()));
-        set_names(&ctx, "ohmarcs", read_unit_names("/^7(\\d{3})$/,Medic $1\n").unit_names, Some(Origin { name: "units.csv".into(), ..Default::default() })).unwrap();
-        assert_eq!(ctx.shared.names.lock().unwrap().unit("ohmarcs", 7042).as_deref(), Some("Medic 042"));
+        assert_eq!(ctx.shared.names.lock().unwrap().tg(oh, 102).map(|t| t.alpha_tag), Some("EMS 2".into()));
+        set_names(&ctx, oh, read_unit_names("/^7(\\d{3})$/,Medic $1\n").unit_names, Some(Origin { name: "units.csv".into(), ..Default::default() })).unwrap();
+        assert_eq!(ctx.shared.names.lock().unwrap().unit(oh, 7042).as_deref(), Some("Medic 042"));
         let mut told = ctx.hub.subscribe();
-        set_unit_name(&ctx, "ohmarcs", 7042, "Bus 14".into()).unwrap();
+        set_unit_name(&ctx, oh, 7042, "Bus 14".into()).unwrap();
         assert!(told.try_recv().is_ok(), "unitNameEdited, to every browser");
-        assert_eq!(ctx.shared.names.lock().unwrap().unit("ohmarcs", 7042).as_deref(), Some("Bus 14"), "named at once, ahead of the pattern");
+        assert_eq!(ctx.shared.names.lock().unwrap().unit(oh, 7042).as_deref(), Some("Bus 14"), "named at once, ahead of the pattern");
         ctx.db.flush().unwrap();
         let cfg = ctx.config.lock().unwrap().clone();
         assert_eq!(kept::load_names(&ctx.db, &cfg), *ctx.names.lock().unwrap(), "kept as held");
-        set_unit_name(&ctx, "ohmarcs", 7042, String::new()).unwrap();
-        assert_eq!(ctx.shared.names.lock().unwrap().unit("ohmarcs", 7042).as_deref(), Some("Medic 042"), "its own taken out: the pattern's again");
-        assert!(set_unit_name(&ctx, "../x", 1, "y".into()).is_err());
+        set_unit_name(&ctx, oh, 7042, String::new()).unwrap();
+        assert_eq!(ctx.shared.names.lock().unwrap().unit(oh, 7042).as_deref(), Some("Medic 042"), "its own taken out: the pattern's again");
+        assert!(system_named(&ctx, "../x").is_err(), "a name no system has");
     }
 }
 
@@ -1795,7 +1868,7 @@ mod live_list_tests {
         assert!(ctx.db.is_disabled());
         let r = crate::db::row::tests::record(9179, 1_700_000_000_000);
         let rel = "ohmarcs/2026/10/26/9179-1700000000_851350000";
-        let entry = index_call(&ctx, rel, &r, true, true);
+        let entry = index_call(&ctx, None, rel, &r, true, true);
         let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
         assert_eq!(entries, [entry]);
         let mut heard = ctx.hub.subscribe();
@@ -1817,7 +1890,7 @@ mod pending_tests {
         let r = crate::db::row::tests::record(9179, 1_700_000_000_000);
         ctx.db.send(crate::db::Change::Meta { key: "warm".into(), value: "1".into() });
         ctx.db.flush().unwrap();
-        let entry = index_call(&ctx, "ohmarcs/pending", &r, true, true);
+        let entry = index_call(&ctx, None, "ohmarcs/pending", &r, true, true);
         let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], entry);
@@ -1832,9 +1905,9 @@ mod pending_tests {
         let ctx = test_ctx_with_batch(&dir, std::time::Duration::from_secs(60));
         let old = crate::db::row::tests::record(1, 1000);
         let new = crate::db::row::tests::record(1, 2000);
-        index_call(&ctx, "ohmarcs/old", &old, true, true);
+        index_call(&ctx, None, "ohmarcs/old", &old, true, true);
         ctx.db.flush().unwrap();
-        index_call(&ctx, "ohmarcs/new", &new, true, true);
+        index_call(&ctx, None, "ohmarcs/new", &new, true, true);
         let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
         let paths: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, ["ohmarcs/new", "ohmarcs/old"]);
@@ -1851,7 +1924,7 @@ mod calls_query_tests {
         let ctx = test_ctx(&dir);
         let mut r = crate::db::row::tests::record(1, 1000);
         r.short_name = "ohmarcs-butler".into();
-        index_call(&ctx, "ohmarcs-butler/x", &r, true, true);
+        index_call(&ctx, None, "ohmarcs-butler/x", &r, true, true);
         ctx.db.flush().unwrap();
         let q = CallsQuery { system: Some("ohmarcs".into()), ..Default::default() };
         assert_eq!(calls(&ctx, &q).entries.len(), 1);
@@ -1863,7 +1936,7 @@ mod calls_query_tests {
         let ctx = test_ctx(&dir);
         for i in 0..501 {
             let r = crate::db::row::tests::record(1, 1000 + i);
-            index_call(&ctx, &format!("ohmarcs/{i}"), &r, true, true);
+            index_call(&ctx, None, &format!("ohmarcs/{i}"), &r, true, true);
         }
         ctx.db.flush().unwrap();
         let page = calls(&ctx, &CallsQuery { limit: Some(9999), ..Default::default() });
@@ -1874,6 +1947,31 @@ mod calls_query_tests {
         assert_eq!((id, page.entries.len()), (serde_json::json!(3), 100));
     }
 
+    /// A system renamed while it records: the run's calls still file under
+    /// its id (the run goes by the name it had at Start), and its names stay
+    /// its own under the new name; the old name is nobody's.
+    #[test]
+    fn a_rename_while_recording_keeps_the_systems_calls_and_names() {
+        let dir = crate::db::TestDir::new("cq-rename");
+        let ctx = crate::protocol_tests::ctx_with(test_config(&dir), &dir, |_| crate::db::Db::for_test_with_batch("cq-rename", Duration::from_millis(10)).0);
+        let id = system_named(&ctx, "ohmarcs").unwrap();
+        set_names(&ctx, id, trunk_core::trunk::parse_rows("Decimal,Alpha Tag\n101,Fire\n"), None).unwrap();
+        let mut cfg = ctx.config.lock().unwrap().clone();
+        cfg.systems[0].short_name = "renamed".into();
+        *ctx.config.lock().unwrap() = cfg.clone();
+        ctx.config_changed(&cfg);
+        // (Its record still says the name the run began with.)
+        let r = crate::db::row::tests::record(7, 1000);
+        assert_eq!(r.short_name, "ohmarcs");
+        index_call(&ctx, Some(id), "ohmarcs/a", &r, true, true);
+        index_call(&ctx, None, "ohmarcs/b", &r, true, true);
+        ctx.db.flush().unwrap();
+        assert_eq!(ctx.db.count(&format!("select count(*) from calls where system_id = {id}")), 1, "filed under its id; one by the old name alone is nobody's");
+        assert_eq!(system_named(&ctx, "renamed"), Ok(id));
+        assert!(system_named(&ctx, "ohmarcs").is_err());
+        assert_eq!(ctx.names.lock().unwrap()[&id].talkgroups.len(), 1, "its names went with it");
+    }
+
     /// Without the radio or talkgroup index, a radio's or talkgroup's list
     /// is its recent calls, and says so; with them, the store's.
     #[test]
@@ -1882,7 +1980,7 @@ mod calls_query_tests {
         let storage = trunk_app::config::StorageSettings { radio_index: false, talkgroup_index: false, ..Default::default() };
         let ctx = crate::protocol_tests::ctx_with(test_config(&dir), &dir, |_| crate::db::Db::from_settings(&storage, &dir));
         let r = crate::db::row::tests::record(7, 1000);
-        index_call(&ctx, "ohmarcs/a", &r, true, true);
+        index_call(&ctx, None, "ohmarcs/a", &r, true, true);
         ctx.db.flush().unwrap();
         let by_tg = calls(&ctx, &CallsQuery { talkgroup: Some(7), ..Default::default() });
         assert!(by_tg.error.as_deref().is_some_and(|e| e.contains("by talkgroup")), "{:?}", by_tg.error);
@@ -1912,12 +2010,44 @@ mod calls_query_tests {
         let ToClient::History { entries, .. } = history(&ctx) else { panic!() };
         assert!(entries.is_empty());
         let r = crate::db::row::tests::record(1, 1000);
-        index_call(&ctx, "ohmarcs/x", &r, true, true);
+        index_call(&ctx, None, "ohmarcs/x", &r, true, true);
         call_files(&ctx, "ohmarcs/x", false, true);
         ctx.db.flush().unwrap();
         // (The live list answers: the calls since the recorder started.)
         let page = calls(&ctx, &CallsQuery::default());
         assert_eq!((page.entries.len(), page.next), (1, None));
         assert!(page.error.is_some_and(|e| e.contains("only the recent calls")), "and says why it's only those");
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    /// A call the recordings folder can't take: the folder says why, counts
+    /// its file, and the call isn't listed as saved; once the folder takes
+    /// files again, the next call is saved and listed.
+    #[test]
+    fn a_call_the_recordings_folder_cant_take_is_counted_and_not_listed() {
+        let root = std::env::temp_dir().join(format!("trunk-pro-finish-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("calls");
+        let ctx = test_ctx(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&dir, b"in the way").unwrap();
+        ctx.folders.recordings.set_path(&dir);
+        let rules = FileRules { archive_wav: true, archive_m4a: false, call_log: true, archive_files_on_failure: true };
+        let call = |n: u32| Finish { rel: format!("ohmarcs/2026/11/22/{n}-1"), system: 0, system_id: None, wav: b"RIFF".to_vec(), record: Default::default(), frames: None, rules, decrypted: false };
+        finish_one(&ctx, &dir, None, call(1), None);
+        let r = ctx.folders.report();
+        assert_eq!((r[0]["ok"].as_bool(), r[0]["why"].as_str(), r[0]["lost"].as_u64()), (Some(false), Some("Not a folder"), Some(1)));
+        assert!(ctx.recent.lock().unwrap().is_empty(), "not listed as a call kept");
+        fs::remove_file(&dir).unwrap();
+        finish_one(&ctx, &dir, None, call(2), None);
+        assert_eq!(ctx.folders.report()[0]["ok"], true);
+        assert!(dir.join("ohmarcs/2026/11/22/2-1.wav").exists() && dir.join("ohmarcs/2026/11/22/2-1.json").exists());
+        assert_eq!(ctx.recent.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -51,9 +51,16 @@ not specify that vendor extension.
 
 ## Release compatibility
 
-Compatibility work on 2026-11-20 targets published
-[v0.3.9](https://github.com/TrunkRecorder/trunk-recorder-pro/releases/tag/v0.3.9),
-commit `5968e907959d64bbb17c5f7b37e9852ff3545cdb`.
+The initial compatibility work targeted v0.3.9, commit
+`5968e907959d64bbb17c5f7b37e9852ff3545cdb`. On 2026-11-22 the complete GPS,
+packet-data and signalling changes were integrated with published
+[v0.4.1](https://github.com/TrunkRecorder/trunk-recorder-pro/releases/tag/v0.4.1),
+commit `ac61394`.
+Upstream already supplies `Position`, `CallSource.position`,
+`CallManager::note_position` and JSON serialization to `srcList[].lat`/`lon`
+for P25. This change adds DMR/Hytera decoders and the standalone packet-data
+routing into that infrastructure; it does not replace the JSON writer.
+
 The release normalizes XPT voice IDs in `Channel`, assembles talker aliases in
 `DmrVoice`, and vocodes both slots without the old `vocode` switch. GPS keeps
 those behaviors and shares the existing voice-LC timestamp for attribution.
@@ -236,3 +243,13 @@ produced no valid control frames on any of the three recordings. Two have
 noise-like amplitude statistics; the third includes weak, bursty energy.
 These results do not identify another protocol or rule out a signal outside
 the captured channel filter. No new decoder is inferred from these files.
+
+
+### Reported live validation
+
+On 2026-11-22 the user reported testing a system with the experimental build:
+radio IDs decoded as expected and latitude/longitude used the correct
+hemisphere. HP782 and PD782i were identified earlier as the radio models in
+use. Exact firmware, test location, packet type and flag values were not
+provided, so this deployment report supplements the capture and synthetic
+tests without establishing additional compressed hemisphere/fix profiles.
