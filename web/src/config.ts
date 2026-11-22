@@ -2,6 +2,18 @@
 
 import type { AdjacentSite, Channel, Config, Conventional, Device, DirectoryLink, FccLicense, FccLicenses, FoundRadio, LogSettings, Radios, RecordingOverride, Site, SiteIdentity, Source, SourceStatus, System, SystemStatus, Talkgroup, UnitName, UnitNames, Origin } from "./protocol.ts";
 import { readTalkgroupFile, splitCsvLine } from "./talkgroups.ts";
+import { SYSTEM_KINDS, type SystemKind } from "./systemKinds.gen.ts";
+
+export { SYSTEM_KINDS };
+
+/** Holds when `A` and `B` are the same type. */
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+/** The config's kinds of system are the recorder's table's (systemKinds.gen.ts). */
+const sameKinds: Same<System["type"], SystemKind> = true;
+void sameKinds;
+
+/** What a kind of system is called ("SmartNet"; P25 when none is said). */
+export const kindLabel = (type: System["type"] | undefined) => SYSTEM_KINDS[type ?? "p25"].label;
 import { readUnitNamesFile } from "./units.ts";
 import { fromNow } from "./origins.ts";
 import { defaultConfig, parseChannelCsv, rateFor, readConfig, receivers, sourceLabels, sourceNames, sourceRates, usableHalfWidth } from "./rules.ts";
@@ -170,9 +182,11 @@ export const SOURCE_KINDS: Record<Source["type"], SourceKind> = {
 
 /** The kinds of source with a driver (installed, or built in) and so the desktop app: the recorder reports each in `radios`. */
 export type DriverKind = keyof Radios;
-export const DRIVER_KINDS = (Object.keys(SOURCE_KINDS) as Source["type"][]).filter((k): k is DriverKind => !!(SOURCE_KINDS[k].driver || SOURCE_KINDS[k].native));
+/** A kind of source the desktop app alone opens: a library loaded at run time, or a driver of its own. */
+export const kindNeedsDriver = (k: Source["type"]): k is DriverKind => !!(SOURCE_KINDS[k].driver || SOURCE_KINDS[k].native);
+export const DRIVER_KINDS = (Object.keys(SOURCE_KINDS) as Source["type"][]).filter(kindNeedsDriver);
 /** A source that needs a driver, and so the desktop app. */
-export const needsDriver = (x: Source): x is Extract<Source, { type: DriverKind }> => !!(SOURCE_KINDS[x.type].driver || SOURCE_KINDS[x.type].native);
+export const needsDriver = (x: Source): x is Extract<Source, { type: DriverKind }> => kindNeedsDriver(x.type);
 /** A source with a bias-T the recorder switches. */
 export const hasBiasT = (x: Source): x is Extract<Source, { biasTee: boolean }> => !!SOURCE_KINDS[x.type].biasT;
 
@@ -305,18 +319,17 @@ function dmrImport(sys: Record<string, unknown>): SystemInput {
 
 /**
  * The site-lock fields a system's protocol states (the recorder's
- * ControlChannel::identity_fields): the lock compares only these. DMR and
- * NXDN Type-D state none (their sites are told apart by colour code / RAN);
- * NXDN Type-C its system and site codes.
+ * System::site_lock_fields): the lock compares only these. DMR and NXDN
+ * Type-D state none (their sites are told apart by colour code / RAN).
  */
 export function siteLockFields(sys: Pick<System, "type" | "nxdnType">): (keyof SiteIdentity)[] {
-  if (sys.type === "nxdn") return sys.nxdnType === "typeD" ? [] : ["sysId", "site"];
-  return sys.type === "smartnet" ? ["sysId", "site"] : sys.type === "edacs" ? ["site"] : sys.type === "dmr" ? [] : ["nac", "wacn", "sysId", "rfss", "site"];
+  if (sys.type === "nxdn" && sys.nxdnType === "typeD") return [];
+  return [...SYSTEM_KINDS[sys.type].siteLock];
 }
 
 /** A system's type as written: "p25" for one this version doesn't know. */
 export function systemType(t: unknown): System["type"] {
-  return t === "smartnet" || t === "dmr" || t === "nxdn" || t === "edacs" ? t : "p25";
+  return typeof t === "string" && Object.hasOwn(SYSTEM_KINDS, t) ? (t as System["type"]) : "p25";
 }
 
 /** Frequencies a watching protocol (DMR, NXDN, EDACS) needs besides the control channels (the recorder's Site::watched_channels). */

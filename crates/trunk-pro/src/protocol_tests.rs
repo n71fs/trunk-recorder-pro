@@ -445,6 +445,7 @@ pub(crate) fn ctx_with(mut cfg: Config, dir: &Path, db: impl FnOnce(crate::runti
         recent: Mutex::new(Default::default()),
         db,
         quit: tokio::sync::Notify::new(),
+        interfaces_due: tokio::sync::Notify::new(),
         survey_last: Mutex::new(None),
         tune: Default::default(),
         plugins: crate::plugins::manage::Plugins::new(hub.clone(), shared.clone()),
@@ -458,16 +459,16 @@ pub(crate) fn ctx_with(mut cfg: Config, dir: &Path, db: impl FnOnce(crate::runti
         engine: Mutex::new(None),
         host_last: Mutex::new(None),
         spool: Mutex::new(None),
+        folders: Default::default(),
         clock: Default::default(),
         unlocked: Default::default(),
         iq: Default::default(),
+        // (Its state kept beside the config, as the recorder's is.)
+        sessions: crate::access::Sessions::fresh_in(dir),
+        passkeys: Default::default(),
+        cloudflare: Default::default(),
+        tls: Default::default(),
     });
-    // The stats thread makes its folder as it starts: wait for that, so a
-    // test that removes `dir` when done does not see it made again after.
-    let t = std::time::Instant::now();
-    while !dir.join("stats").exists() && t.elapsed() < std::time::Duration::from_secs(1) {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
     ctx
 }
 
@@ -535,9 +536,13 @@ fn the_servers_messages() {
     .unwrap();
     cfg.sources.extend(more.sources);
     cfg.systems = more.systems;
+    cfg.assign_system_ids();
+    let p25 = cfg.id_of("p25").unwrap();
     cfg.server.allowed_origins = vec!["http://localhost:3000".into()];
     cfg.server.interfaces.insert("wall".into(), trunk_app::config::Interface { port: 8081, path: "ui/wall".into(), ..Default::default() });
     cfg.server.interfaces.insert("trunkamp".into(), trunk_app::config::Interface { port: 8082, access: trunk_app::config::ApiAccess::Control, ..Default::default() });
+    let secret = crate::access::add_user(&mut cfg.server.auth, "luke", trunk_app::config::ApiAccess::Control).unwrap();
+    cfg.server.auth.anonymous = Some(trunk_app::config::ApiAccess::Listen);
 
     let ctx = ctx(cfg.clone(), &dir);
     // Something in the registry and the history to ask about.
@@ -551,10 +556,10 @@ fn the_servers_messages() {
             sources: vec![trunk_core::trunk::CallSource { src: 7, ..Default::default() }, trunk_core::trunk::CallSource { src: 8, time_s: 2.0, ..Default::default() }],
             ..Default::default()
         };
-        r.call_start("p25", &c, now - 10);
-        r.call_end("p25", &c, now - 6);
-        r.message("p25", &trunk_core::trunk::Message { kind: trunk_core::trunk::MessageType::Affiliation, source: 7, talkgroup: 101, ..Default::default() }, now);
-        r.concluded("p25", &serde_json::from_value(json!({ "freq": 851_012_500u64, "snr": 18.5, "errorList": [{ "frames": 50, "error_count": 2, "bad_frames": 0 }] })).unwrap(), now);
+        r.call_start(p25, &c, now - 10);
+        r.call_end(p25, &c, now - 6);
+        r.message(p25, &trunk_core::trunk::Message { kind: trunk_core::trunk::MessageType::Affiliation, source: 7, talkgroup: 101, ..Default::default() }, now);
+        r.concluded(p25, &serde_json::from_value(json!({ "freq": 851_012_500u64, "snr": 18.5, "errorList": [{ "frames": 50, "error_count": 2, "bad_frames": 0 }] })).unwrap(), now);
     }
     ctx.series.lock().unwrap().insert(&trunk_app::stats::Rollup { t: now / 60 * 60, values: [("sys/p25/cc/good".to_string(), [30.0, 28.0, 33.0])].into() });
     ctx.event(trunk_app::stats::MonitorEvent::ControlLost { system: "p25".into(), site: Some("south".into()), freq_hz: Some(851_012_500) });
@@ -565,11 +570,14 @@ fn the_servers_messages() {
     let p = platform.sample(&mut agg, true);
     *ctx.host_last.lock().unwrap() = Some(crate::monitor::message(now as f64, &agg, p));
     let unit_names = trunk_core::trunk::read_unit_names("7,Engine 7\n").unit_names;
-    *ctx.names.lock().unwrap() = [("p25".to_string(), trunk_app::config::SystemNames { talkgroups: trunk_core::trunk::parse_rows("101,Fire Dispatch\n"), unit_names })].into();
+    *ctx.names.lock().unwrap() = [(p25, trunk_app::config::SystemNames { talkgroups: trunk_core::trunk::parse_rows("101,Fire Dispatch\n"), unit_names })].into();
+    // (The name book knows the systems as the server sets it from the config.)
+    ctx.shared.names.lock().unwrap().set_config(&cfg, &Default::default());
     // The greeting: hello last, after how things are now; less of it for listen access.
     let heard = |control| {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let msgs = rt.block_on(crate::server::greeting(&ctx, control));
+        let access = if control { trunk_app::config::ApiAccess::Control } else { trunk_app::config::ApiAccess::Listen };
+        let msgs = rt.block_on(crate::server::greeting(&ctx, access, control.then(|| "luke".to_string())));
         msgs.iter().filter_map(|m| crate::server::text_for(&crate::runtime::Out::of(m), control)).map(|t| serde_json::from_str::<Value>(&t).unwrap()).collect::<Vec<Value>>()
     };
     let (greeting, listening) = (heard(true), heard(false));
@@ -589,8 +597,12 @@ fn the_servers_messages() {
     assert!(matches!(crate::runtime::Out::of(&host), crate::runtime::Out::Text(_)), "host is sent to some connections only");
     assert!(listening.iter().find(|m| m["type"] == "host").unwrap()["t"].is_number());
     assert!(greeting.last().unwrap()["configPath"].is_string() && listening.last().unwrap().get("configPath").is_none());
+    assert_eq!((&greeting.last().unwrap()["access"], &greeting.last().unwrap()["user"], &listening.last().unwrap()["access"]), (&json!("control"), &json!("luke"), &json!("listen")));
+    assert!(listening.last().unwrap().get("user").is_none());
     let config = |g: &[Value]| g.iter().find(|m| m["type"] == "config").unwrap()["config"].clone();
-    assert_eq!(config(&listening), crate::access::redact_config(config(&greeting)));
+    let sent = |c: Value| serde_json::to_value(crate::access::view::listen_config(&serde_json::from_value(c).unwrap())).unwrap();
+    assert_eq!(config(&listening), sent(config(&greeting)));
+    assert_ne!(config(&listening), config(&greeting), "and not the whole of it");
     let q = serde_json::from_value(json!({ "id": 1, "series": ["sys/p25/*"], "range": "1h" })).unwrap();
     let mut queries = vec![crate::server::stats_query(&ctx, &q).to_value()];
     assert!(queries[0]["series"]["sys/p25/cc/good"]["v"].is_array(), "{}", queries[0]);
@@ -609,7 +621,7 @@ fn the_servers_messages() {
     // The call store answers `callsQuery`: a call indexed, then asked for by talkgroup.
     let mut record = crate::db::row::tests::record(9179, now * 1000);
     record.short_name = "p25".into();
-    crate::runtime::index_call(&ctx, "p25/2026/10/26/9179-1", &record, true, true);
+    crate::runtime::index_call(&ctx, None, "p25/2026/10/26/9179-1", &record, true, true);
     ctx.db.flush().unwrap();
     let Ok(Command::CallsQuery { id, query }) = Command::parse(r#"{"type":"callsQuery","id":3,"talkgroup":9179}"#) else { panic!("callsQuery") };
     let calls = crate::runtime::calls_query(&ctx, id, &query).to_value();
@@ -618,9 +630,9 @@ fn the_servers_messages() {
     assert_eq!(queries[2]["rows"][0]["alphaTag"], "", "no talkgroup file for p25 here");
     assert_eq!(queries[4]["talkers"].as_array().map(Vec::len), Some(2));
     // Named from the name book the server keeps (talkgroup files and the config; aliases as saved).
-    let files = trunk_app::config::talkgroup_lists([("p25", trunk_core::trunk::parse_rows("Decimal,Hex,Alpha Tag,Mode,Description,Tag,Category\n101,65,FD Dispatch,D,Dispatch,Fire Dispatch,Fire\n"))]);
+    let files = trunk_app::config::talkgroup_lists([(p25, trunk_core::trunk::parse_rows("Decimal,Hex,Alpha Tag,Mode,Description,Tag,Category\n101,65,FD Dispatch,D,Dispatch,Fire Dispatch,Fire\n"))]);
     ctx.shared.names.lock().unwrap().set_config(&cfg, &files);
-    ctx.shared.names.lock().unwrap().set_units("p25", "7,Engine 7\n");
+    ctx.shared.names.lock().unwrap().set_units(p25, "7,Engine 7\n");
     let named = |q: Value| crate::server::radio_query(&ctx, &body(q)).to_value().to_string();
     assert!(named(json!({ "id": 10, "what": "talkgroups", "system": "p25", "hours": 24 })).contains("FD Dispatch"));
     assert!(named(json!({ "id": 11, "what": "units", "system": "p25" })).contains("Engine 7"));
@@ -643,6 +655,8 @@ fn the_servers_messages() {
         crate::server::tr_config(&dir.display().to_string()),
         crate::server::tr_config(&dir.join("nothing.json").display().to_string()),
         ToClient::Quit,
+        ToClient::TokenCreated { id: 4, name: "luke".into(), secret: Some(secret), error: None },
+        ToClient::TokenCreated { id: 5, name: "luke".into(), secret: None, error: Some("There's a user named \"luke\" already.".into()) },
         ToClient::LicenseResult { id: 1, results: vec![json!({ "freqHz": 857_987_500, "historical": false, "licenses": [{ "callSign": "WPXT459", "licensee": "DISTRICT OF COLUMBIA", "serviceCode": "YE", "serviceDesc": null, "freqHz": 857_987_500, "emission": "8K10F1E", "distanceM": 1374, "bearingDeg": 115, "bearingCardinal": "ESE", "city": "WASHINGTON", "state": "DC", "status": "A", "locationKind": "fixed" }] })], error: None },
         ToClient::CallSignResult { id: 3, results: vec![json!({ "callSign": "KNJA391", "licensee": "DISTRICT OF COLUMBIA", "serviceCode": "YE", "serviceDesc": null, "status": "A", "city": "WASHINGTON", "state": "DC" })], error: None },
         ToClient::LicenseResult { id: 2, results: vec![], error: Some("Couldn't reach https://trunkrecorder.pro".into()) },
@@ -708,6 +722,7 @@ fn messages_to_the_recorder() {
         json!({ "type": "setUnitName", "system": "dcfd", "unit": 1234, "name": "Bus 14" }),
         json!({ "type": "setTalkgroup", "system": "dcfd", "talkgroup": 101, "edit": { "ignore": true } }),
         json!({ "type": "setTalkgroup", "system": "dcfd", "talkgroup": 102, "edit": { "alphaTag": "FIRE4A", "description": "", "tag": "Fire Tac", "category": "Fire" } }),
+        json!({ "type": "createToken", "id": 6, "name": "kiosk", "access": "listen" }),
     ];
     check_all("ToRecorder", &msgs);
     // And the recorder reads each as the docs give it.
@@ -760,7 +775,7 @@ fn live_voice_is_the_plugin_topics_chunk() {
     use trunk_recorder_plugin::{Codec, FrameKind, HostMessage, VoiceFrame};
     let frame = |codec: Codec, kind| VoiceFrame { codec, bits: (0..codec.bits()).map(|i| (i % 3 == 0) as u8).collect(), e0: 1, errs: 2, erased: false, kind, tone: None };
     let audio = trunk_core::trunk::LiveAudio { call_id: 7, system: 0, talkgroup: 101, unit: 1234, samples: vec![0.0; 160], frames: vec![frame(Codec::Imbe, FrameKind::Voice), frame(Codec::Imbe, FrameKind::Repeat)], decrypted: false };
-    let chunk = trunk_app::session::voice_chunk("dcfd", "E1", &audio).unwrap();
+    let chunk = trunk_app::session::voice_chunk(1, "dcfd", "E1", &audio).unwrap();
     let msg = ToClient::Voice { chunk: chunk.clone() }.to_value();
     check("FromRecorder", &msg).unwrap();
     let mut plugin = serde_json::to_value(HostMessage::Voice(chunk)).unwrap();
@@ -768,8 +783,8 @@ fn live_voice_is_the_plugin_topics_chunk() {
     assert_eq!(msg["chunk"], plugin);
     assert_eq!(msg["chunk"]["frames"][1]["kind"], "repeat");
     let tone = trunk_core::trunk::LiveAudio { frames: vec![VoiceFrame { tone: Some((5, 20)), ..frame(Codec::Ambe, FrameKind::Tone) }], ..audio.clone() };
-    check("FromRecorder", &ToClient::Voice { chunk: trunk_app::session::voice_chunk("dcfd", "", &tone).unwrap() }.to_value()).unwrap();
-    assert!(trunk_app::session::voice_chunk("dcfd", "", &trunk_core::trunk::LiveAudio { frames: vec![], ..audio }).is_none(), "analog: none");
+    check("FromRecorder", &ToClient::Voice { chunk: trunk_app::session::voice_chunk(1, "dcfd", "", &tone).unwrap() }.to_value()).unwrap();
+    assert!(trunk_app::session::voice_chunk(1, "dcfd", "", &trunk_core::trunk::LiveAudio { frames: vec![], ..audio }).is_none(), "analog: none");
 }
 
 /// Every series' running totals: a conventional channel's one transmission (0.5–2.5 s in,

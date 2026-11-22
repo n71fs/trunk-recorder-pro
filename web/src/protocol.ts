@@ -307,6 +307,8 @@ export interface SignalDef {
 
 /** One site of a system: a control channel to follow, and how. */
 export interface Site {
+  /** Its number, the same across renames and runs, never another site's (any system's): what plugins know it by. Given by the recorder. */
+  id?: number;
   /** Its name, unique in its system (absent: the system's short name). The talkgroup file's
    *  Preferred Site names it; calls and plugins say it. */
   name?: string;
@@ -370,6 +372,10 @@ export interface PluginSetup {
   path?: string;
   /** Give it calls decrypted with the recorder's keys (their audio and files). Off: none are. */
   shareDecrypted?: boolean;
+  /** The systems (by `id`) it's turned off for: nothing about them is sent to it. Only for a plugin that can be (`PluginInfo.perSystem`). */
+  systemsOff?: number[];
+  /** The sites (by `id`) it's turned off for: their unit events and status aren't sent, nor a recorded call only they heard. */
+  sitesOff?: number[];
 }
 
 /** The settings each system can set again for itself (crates/trunk-app/src/config.rs RecordingOverride). */
@@ -540,6 +546,8 @@ export interface Config {
   conventional: Conventional[];
   /** The next system id the recorder gives: above every one given, so none is given twice. */
   nextSystemId?: number;
+  /** The next site id the recorder gives, as `nextSystemId`. */
+  nextSiteId?: number;
   recording: Recording;
   server: {
     /** The address every interface listens on. */
@@ -553,6 +561,12 @@ export interface Config {
     interfaces?: Record<string, InterfaceSetup>;
     /** Where the trunkrecorder.pro API is, for the survey's license lookup (absent: https://trunkrecorder.pro). */
     trpApi?: string;
+    /** Signing in, on every interface's port (absent: off). Not in a listen-only connection's config. */
+    auth?: AuthSetup;
+    /** HTTPS on every interface's port (absent: plain HTTP). Read as the app starts; a renewed certificate is picked up without a restart. */
+    tls?: TlsSetup;
+    /** The name this computer is reached by over HTTPS (its certificate's): the URLs the recorder logs and opens, and where passkeys work besides localhost (absent: none). With a port ("radio.example.com:8443"): the dashboard's, where a proxy in front serves it. */
+    hostname?: string;
   };
   /** The plugins, by id (desktop app). Their settings for each system are in the system. */
   plugins?: Record<string, PluginSetup>;
@@ -610,10 +624,109 @@ export interface MonitorSettings {
 
 /**
  * What a page may do with the recorder's API. "listen": see what the recorder does and play its
- * calls, change nothing (its config comes without plugin settings and key sources). "control":
+ * calls, change nothing (its config is only what its pages show: no plugin settings, key sources, users, addresses or folders). "control":
  * everything the built-in interface can.
  */
 export type ApiAccess = "listen" | "control";
+
+/**
+ * Signing in. `enabled`: a request gets the lower of its port's access and its user's — signed in with their access
+ * token's secret as `Authorization: Bearer`, `?token=`, or the cookie POST /api/login (or a passkey's sign-in) sets, or
+ * by the `proxy` in front — and without one, `anonymous`'s (absent: it must sign in; GET /api/session says so). Enabled,
+ * it needs a user with control access and a token or a passkey (or a proxy set), and `anonymous` can't be "control".
+ */
+export interface AuthSetup {
+  enabled: boolean;
+  anonymous?: ApiAccess;
+  /** Who may sign in, by name. Made with createToken (the token's secret is shown once); removed by taking them out. */
+  users?: Record<string, AuthUser>;
+  /** A reverse proxy in front that signs people in, and says who in a header. Absent: none. */
+  proxy?: AuthProxy;
+}
+
+/**
+ * A reverse proxy that signs people in (Authelia, oauth2-proxy, tailscale serve): the name in its `header` is believed
+ * from the addresses in `from` alone (IPs or CIDR blocks; one that's neither isn't saved), and only when no token or
+ * session says who. With `cloudflare` set, Cloudflare Access instead: the email in its signed token, checked, from any
+ * address (`from` and `header` unused). The name is the user `users` maps it to, else the user of that name, with their
+ * role; any other name gets `other` (absent: not signed in; "control" is refused).
+ */
+export interface AuthProxy {
+  /** Empty with `cloudflare` set. */
+  from: string[];
+  /** Default "Remote-User". */
+  header?: string;
+  /** Cloudflare Access in front. Absent: none. */
+  cloudflare?: AuthCloudflare;
+  /** The proxy's names for users whose name here differs ("luke@example.com": "luke"). */
+  users?: Record<string, string>;
+  other?: ApiAccess;
+}
+
+/**
+ * Cloudflare Access's application: its tokens (`Cf-Access-Jwt-Assertion`) are checked against `team`'s keys (its name,
+ * or `https://<team>.cloudflareaccess.com`), for its Audience (AUD) tag `aud`. Either not so isn't saved.
+ */
+export interface AuthCloudflare {
+  team: string;
+  aud: string;
+}
+
+/** Someone (or a program) who may sign in: what they may do, and what they sign in with (neither: nothing yet). */
+export interface AuthUser {
+  access: ApiAccess;
+  token?: AuthToken;
+  /** Their passkeys: added by them, signed in, from a browser (POST /api/passkey/register/…); removed or renamed by editing this. */
+  passkeys?: AuthPasskey[];
+}
+
+/** A passkey: its name ("iPhone"), when it was added (Unix s), its credential id (base64url) and `key`, WebAuthn's record of it (its public key and counter; the recorder's to read). */
+export interface AuthPasskey {
+  name: string;
+  created: number;
+  id: string;
+  key: unknown;
+}
+
+/** A passkey of the signed-in user's, as the session lists it: never its key. */
+export type OwnPasskey = Pick<AuthPasskey, "id" | "name" | "created">;
+
+/** GET /api/session: how the recorder sees this request. */
+export interface Session {
+  /** Signing in is on. */
+  auth: boolean;
+  /** What this request may do; null: sign in first. */
+  access: ApiAccess | null;
+  /** The user it signed in as, by name; null when it didn't (a token of no user, signing in off, not signed in). */
+  user: string | null;
+  /** The proxy in front signed it in (then it's the proxy's to sign out of). */
+  proxy?: boolean;
+  /** Passkeys work here: the built-in interface's port, on a host they work on. */
+  passkeys?: boolean;
+  /** The one origin passkeys work at (from any port: a page elsewhere links there); absent when none. */
+  passkeyOrigin?: string;
+  /** The signed-in user's own passkeys; absent when none, or not signed in as a user. */
+  ownPasskeys?: OwnPasskey[];
+}
+
+/** An access token: its secret's SHA-256 (hex). The secret itself is never kept. */
+export interface AuthToken {
+  hash: string;
+  /** When it was made, Unix s. */
+  created: number;
+}
+
+/**
+ * HTTPS: PEM files on the recorder's computer, each absolute, `~/…` or relative to the config file's folder. `cert`: the
+ * certificate, its chain after it (Let's Encrypt's fullchain.pem); `key`: its private key. A config whose pair can't be
+ * read, or whose key isn't the certificate's, isn't saved.
+ */
+export interface TlsSetup {
+  cert: string;
+  key: string;
+  /** Strict-Transport-Security, a year: browsers keep to HTTPS on every port of this host name (absent: off). */
+  hsts?: boolean;
+}
 
 /** An interface besides the built-in one: static web files, served with the API beside them on a port of its own. */
 export interface InterfaceSetup {
@@ -796,7 +909,7 @@ export interface DmrSiteStatus {
    *  it splits into the network and site the site's `identity` carries) and which category of
    *  radio may use the site. */
   sysCode: { code: number; model: "Tiny" | "Small" | "Large" | "Huge"; category: "reserved" | "A" | "B" | "A+B" } | null;
-  /** Capacity Plus: the rest channel's logical slot number, and its frequency once known. */
+  /** Capacity Plus and XPT: the rest channel's logical slot number, and its frequency once known. */
   rest: { lsn: number; freqHz: number | null } | null;
   /** Keyed CRCs (restricted access). */
   keyed: boolean;
@@ -943,8 +1056,10 @@ export interface VoiceFrame {
 /** A digital call's live voice as vocoder frames: the `voice` plugin topic's chunk, as it is. */
 export interface VoiceChunk {
   call_id: number;
-  /** Its system's number this run; `short_name` is its identity. */
+  /** Its system's number this run. */
   system: number;
+  /** Its system's id: the same across renames and runs. */
+  system_id: number;
   short_name: string;
   talkgroup: number;
   /** Who is talking (0: not known yet), and their name. */
@@ -964,6 +1079,11 @@ export interface CallRecord {
   short_name?: string;
   /** The site its copy was kept from (a system of one site: its short name). */
   site?: string;
+  /** Its system's and its site's ids (the same across renames and runs). */
+  system_id?: number;
+  site_id?: number;
+  /** Every site it was recorded on, `site` first. */
+  sites?: { id: number; name: string }[];
   talkgroup: number;
   /** Conventional P25 / DMR / NXDN: the talkgroup the air named (`talkgroup` is what the call is filed under, which a channel row may set to another number). */
   talkgroup_ota?: number;
@@ -1346,6 +1466,10 @@ export interface PluginManifest {
   audio_formats: string[];
   config?: PluginSchema;
   system_config?: PluginSchema;
+  /** Those of its settings (`config`'s top-level keys) a system may set again for itself; none: every system has the plugin's. */
+  system_overrides?: string[];
+  /** Those of its settings for each system (`system_config`'s top-level keys) a site may set again for itself; none: a system's sites have its settings. */
+  site_overrides?: string[];
   homepage?: string;
   repository?: string;
   authors?: string[];
@@ -1416,15 +1540,24 @@ export type SystemPluginValues = PluginValues | PluginValues[];
 /** The key in a system's settings for a plugin that holds the plugin settings it overrides. */
 export const OVERRIDE = "override";
 
+/** The key in a system's settings for a plugin that holds each site's own (by site id): what it sets again of the system's. */
+export const PER_SITE = "perSite";
+
 /** A system's settings for a plugin, one per copy of it. */
 export function pluginCopies(v: SystemPluginValues | undefined): PluginValues[] {
   return v === undefined || v === null ? [] : Array.isArray(v) ? v : [v];
 }
 
-/** A copy's own settings (without what it overrides). */
+/** A copy's own settings (without what it overrides, nor its sites'). */
 export function copyOwn(v: PluginValues | undefined): PluginValues {
-  const { [OVERRIDE]: _, ...own } = v ?? {};
+  const { [OVERRIDE]: _, [PER_SITE]: __, ...own } = v ?? {};
   return own;
+}
+
+/** Each site's own settings in a copy, by site id. */
+export function copyPerSite(v: PluginValues | undefined): Record<string, PluginValues> {
+  const o = v?.[PER_SITE];
+  return o && typeof o === "object" && !Array.isArray(o) ? (o as Record<string, PluginValues>) : {};
 }
 
 /** The plugin settings a copy overrides. */
@@ -1444,6 +1577,8 @@ export interface PluginInfo {
   unlistedFrom?: string | null;
   /** Null when it can't be asked (see `problem`). */
   manifest: PluginManifest | null;
+  /** It can be turned off for a system: everything it takes is one system's (not `totals`). */
+  perSystem: boolean;
   problem: string | null;
   runtime: PluginRuntime;
 }
@@ -1533,7 +1668,7 @@ export interface DirListing {
 // ── The dashboard ────────────────────────────────────────────────────────────
 //
 // Series are named by `/`-separated keys (crates/trunk-app/src/stats):
-//   src/<label>/{noise,peak,clipPct,samples,dropped,errors,ppm,tune}
+//   src/<label>/{noise,peak,clipPct,quiet,samples,dropped,errors,ppm,tune}
 //   sys/<shortName>/{active,recording,calls,airMs,audioBytes,notSaved,dup}
 //   <site>/cc/{good,bad,locked,syncs,nidFails,flywheels,eqResets,frames,sep,offset,signal,noise,snr,inSync,deviation,airSym,syncLossSym,phaseErr}
 //   <site>, <channel>: calls/{started,recorded,skipped}  calls/why/<ignored|unknownTg|encrypted|noSource|noRecorder|noFrequency>
@@ -1604,11 +1739,14 @@ export interface MonitorEventBody {
     | "controlRegained"
     | "sourceDrops"
     | "sourceClipping"
+    | "sourceQuiet"
     | "sourceRecovered"
     | "pluginHealth"
     | "linkDown"
     | "linkUp"
     | "diskLow"
+    | "folderUnwritable"
+    | "folderWritable"
     | "spoolLow"
     | "spoolFull"
     | "spoolRecovered"
@@ -1635,6 +1773,8 @@ export interface MonitorEventBody {
   source?: string;
   perS?: number;
   pct?: number;
+  /** sourceQuiet: its peaks over the last minute, averaged, dBFS (gain too low). */
+  peakDb?: number;
   plugin?: string;
   state?: string;
   message?: string;
@@ -1654,6 +1794,28 @@ export interface MonitorEventBody {
   bad?: boolean;
   /** clockStep: how far the wall clock jumped, ms (positive: forward). */
   byMs?: number;
+  /** folderUnwritable, folderWritable: which folder ("recordings", "spool"); with `why`, `path`. */
+  folder?: string;
+  /** folderUnwritable: what the system said, and what to do. */
+  detail?: string;
+  fix?: string;
+  /** folderWritable: files not written meanwhile. */
+  lost?: number;
+}
+
+/** A folder calls are written to, and whether it takes them: checked at startup and when it changes, then told by every write. */
+export interface FolderRow {
+  /** "recordings", "spool" (while it's on). */
+  name: string;
+  path: string;
+  /** null: not checked yet. */
+  ok: boolean | null;
+  /** While it fails: why in a few words, what the system said, what to do, since (Unix s), and files not written since. */
+  why?: string;
+  detail?: string;
+  fix?: string | null;
+  since?: number;
+  lost?: number;
 }
 
 /** The computer, as last sampled (desktop app). Missing values are listed in `unavailable`. */
@@ -1669,6 +1831,7 @@ export interface PlatformInfo {
   uptimeS: number;
   /** "recordings", "data", and "spool" (the RAM spool, with its `kind`, calls `overflowed` to the disk, times it was `removed` while running, and `missing`: gone and not made again). */
   disks: { name: string; path: string; mount: string; totalBytes: number; freeBytes: number; kind?: string; overflowed?: number; removed?: number; missing?: boolean }[];
+  folders?: FolderRow[];
   /** macOS: whether Spotlight indexes the recordings folder (null: not checked yet, or not macOS). */
   spotlight?: { path: string; state: "indexed" | "excluded" | "unknown"; why: string } | null;
   /** A newer release on GitHub than the one running (checked once a day); null when up to date, not checked yet, or `monitor.checkUpdates` is off. */
@@ -1936,12 +2099,13 @@ export type Capability = "service" | "drivers" | "plugins" | "interfaces" | "hos
 /** A gain as set: each knob (`lna`, `mixer`, `vga`, `amp`, `pga`; `step`: an Airspy table's; `gain`: the overall dB) and its value. */
 export type GainSetting = [string, number][];
 
-/** How a candidate gain compared with the one it would replace, over the rounds: `diff` (candidate less incumbent, 0–100 points) and its standard error `se`. */
+/** How a candidate gain compared with the one it would replace, over the rounds: `diff` (candidate less incumbent, 0–100 points) and its standard error `se`; `snr`, the same of the control channel's SNR (dB), the tie-break where decoding is already full. */
 export interface GainCmp {
   diff: number;
   se: number;
   incumbent: number;
   candidate: number;
+  snr?: { diff: number; se: number };
 }
 
 /** One system's figures in a comparison: [incumbent, candidate]. */
@@ -1984,6 +2148,8 @@ export interface TuneReport {
   elapsedS: number;
   best?: GainSetting;
   applied: boolean;
+  /** The radio was changed in Setup since: what it found was about the gain it had then. */
+  outdated?: boolean;
   error?: string;
 }
 
@@ -2186,6 +2352,10 @@ export type FromRecorder =
       surveyBands: SurveyBand[];
       /** What this recorder can do beyond recording: show only what works. The desktop app can do all of them; the browser build, none. */
       capabilities: Capability[];
+      /** What this connection may do: its port's access, and no more than its user's with signing in on. */
+      access: ApiAccess;
+      /** The user it signed in as, by name. */
+      user?: string;
     }
   /** The latest calls, newest first: on connecting (then `concluded` for each new one). */
   | { type: "history"; entries: CallEntry[]; next?: string }
@@ -2274,6 +2444,8 @@ export type FromRecorder =
   | { type: "dataDeleted"; id: number; deleted: DataCounts; error?: string }
   /** Answers compactData: the store's size in bytes before and after (SQLite: its files; PostgreSQL: its tables and indexes); `error`: it couldn't. */
   | { type: "dataCompacted"; id: number; beforeBytes: number; afterBytes: number; error?: string }
+  /** Answers createToken, to that connection alone: the new user's access token's `secret`, shown this once (the config keeps its hash); `error`: it wasn't made. */
+  | { type: "tokenCreated"; id: number; name: string; secret?: string; error?: string }
   | { type: "quit" };
 
 export type ToRecorder =
@@ -2371,6 +2543,8 @@ export type ToRecorder =
   | { type: "deleteData"; id: number; kinds: DataKind[]; system?: number }
   /** Give the space deleted data left in the store back to the disk (SQLite: VACUUM; PostgreSQL: VACUUM FULL); writes wait meanwhile. Answered with dataCompacted. */
   | { type: "compactData"; id: number }
+  /** A new user `name` (1–64 characters, not taken) with `access` and an access token, put in the config's server.auth.users; works with signing in off too. Answered with tokenCreated. */
+  | { type: "createToken"; id: number; name: string; access: ApiAccess }
   | { type: "quit" };
 
 /** Live audio: one 20 ms (or longer) chunk of a call, 8 kHz. */

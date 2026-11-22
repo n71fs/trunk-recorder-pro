@@ -64,6 +64,14 @@ pub mod topic {
     pub fn is_live(topic: &str) -> bool {
         topic == AUDIO || topic == VOICE
     }
+
+    /// What it sends can be kept from a plugin system by system, so a plugin
+    /// taking only such topics can be turned off for a system ([`super::Manifest::per_system`]):
+    /// every topic but [`TOTALS`], whose series add up every system's. Of [`STATUS`],
+    /// a plugin is sent the systems it's on for; of [`LOG`], lines about no one system too.
+    pub fn per_system(topic: &str) -> bool {
+        topic != TOTALS
+    }
 }
 
 /// Audio formats a plugin can ask for ([`Manifest::audio_formats`]). A plugin
@@ -101,6 +109,18 @@ pub struct Manifest {
     /// object); the form repeats it under each system.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_config: Option<Value>,
+    /// Those of its settings ([`Manifest::config`], top-level keys) a system
+    /// may set again for itself (another server for it, say), which it reads
+    /// from [`SystemInfo::settings`]. None (the default): every system has the
+    /// plugin's settings, and a system's card in Setup offers none of them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub system_overrides: Vec<String>,
+    /// Those of its settings for each system ([`Manifest::system_config`],
+    /// top-level keys) a site of a system may set again for itself (an
+    /// uploader's account for that site, say): in [`SiteInfo::config`]. None
+    /// (the default): a system's sites have its settings.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub site_overrides: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub homepage: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -164,6 +184,10 @@ impl Manifest {
     }
     pub fn wants_format(&self, format: &str) -> bool {
         self.audio_formats.iter().any(|f| f == format)
+    }
+    /// It can be turned off for a system: each topic it takes is [`topic::per_system`].
+    pub fn per_system(&self) -> bool {
+        self.subscribe.iter().all(|t| topic::per_system(t))
     }
 }
 
@@ -242,7 +266,8 @@ pub struct Hello {
     /// The plugin's settings, as the user entered them (see [`Manifest::config`]);
     /// each system's, with its overrides, are in [`SystemInfo::settings`].
     pub config: Value,
-    /// Every system calls can come from, including conventional channels.
+    /// Every system calls can come from, including conventional channels;
+    /// not those the plugin is turned off for (nothing about them is sent).
     pub systems: Vec<SystemInfo>,
     /// Where calls are stored.
     pub capture_dir: PathBuf,
@@ -265,12 +290,15 @@ pub struct HostInfo {
 pub struct SystemInfo {
     /// The number events carry for it (`system`) while the recorder runs:
     /// from 0, the trunked systems then the conventional ones (each a
-    /// system of its own here). It can change between runs: know systems by
-    /// `short_name`.
+    /// system of its own here). It changes between runs, as systems are
+    /// added, removed or turned off: for this run only.
     pub index: u16,
-    /// The system's short name: its identity (unique among all the
-    /// recorder's systems), its folder, and what users know it by. Every
-    /// event carries it.
+    /// Its id: the same across runs and renames, never another system's.
+    /// Know a system by it (events carry it as `system_id`).
+    pub id: u32,
+    /// The system's short name: unique among the recorder's systems, its
+    /// folder, and what users know it by (it changes when it's renamed).
+    /// Every event carries it.
     pub short_name: String,
     /// "p25" | "smartnet" | "dmr" | "nxdn" | "edacs" | "conventional"
     pub kind: String,
@@ -297,18 +325,39 @@ pub struct SystemInfo {
     /// null when the user left them empty.
     pub config: Value,
     /// The plugin's own settings ([`Hello::config`]) as they are for this
-    /// system: a system can override some of them (another server, say).
+    /// system: a system can set again those [`Manifest::system_overrides`]
+    /// names (another server, say).
     /// Null: as in `Hello::config`.
     #[serde(skip_serializing_if = "Value::is_null")]
     pub settings: Value,
+}
+
+/// A site, by its id and its name ([`CallRecord::sites`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SiteRef {
+    pub id: u32,
+    pub name: String,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// One site of a [`SystemInfo`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SiteInfo {
-    /// What calls and unit events carry as `site`.
+    /// Its id: the same across runs and renames, never another site's (any
+    /// system's). Events carry it as `site_id`.
+    pub id: u32,
+    /// What calls and unit events carry as `site` (it changes when it's renamed).
     pub name: String,
+    /// The plugin's settings for this site ([`SystemInfo::config`] with
+    /// those the site sets again: [`Manifest::site_overrides`]). Null: as
+    /// the system's.
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub config: Value,
 }
 
 /// Who is licensed on one of a system's frequencies ([`SystemInfo::fcc`]).
@@ -327,14 +376,19 @@ pub struct FccLicense {
 pub struct CallInfo {
     /// Unique while the recorder runs (Trunk Recorder's call_num).
     pub id: u32,
-    /// [`SystemInfo::index`]: for this run only; `short_name` is the system's identity.
+    /// [`SystemInfo::index`]: for this run only.
     pub system: u16,
+    /// [`SystemInfo::id`]: the system's identity.
+    pub system_id: u32,
     pub short_name: String,
     /// The site it is on (its name; a system of one site's is its short
     /// name; empty for a conventional system's call). A call heard on
     /// several sites is told once, by the site that had it first.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub site: String,
+    /// That site's [`SiteInfo::id`] (0: none).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub site_id: u32,
     pub talkgroup: u32,
     /// Conventional P25 / DMR / NXDN: the talkgroup the air named (this
     /// recorder's addition, like `site`). `talkgroup` is what the call is
@@ -533,10 +587,22 @@ pub struct CallRecord {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub voice_mode: String,
     pub short_name: String,
+    /// Its system's id ([`SystemInfo::id`]; this recorder's addition): the
+    /// same across renames and runs, unlike `short_name` and `system`. 0: not known.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub system_id: u32,
     /// The site its copy was kept from (this recorder's addition; a system
     /// of one site: its short name; none for a conventional system's).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub site: String,
+    /// That site's id ([`SiteInfo::id`]; this recorder's addition). 0: none.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub site_id: u32,
+    /// Every site of its system it was recorded on (this recorder's addition):
+    /// the one its copy was kept from first, then those whose copies were
+    /// the same call. None for a conventional system's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<SiteRef>,
     /// Every talkgroup patched with this one during the call, its own
     /// included; absent (empty) when it wasn't patched with another.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -609,6 +675,9 @@ impl Default for CallRecord {
             voice_mode: String::new(),
             short_name: String::new(),
             site: String::new(),
+            system_id: 0,
+            site_id: 0,
+            sites: Vec::new(),
             patched_talkgroups: Vec::new(),
             freq_list: Vec::new(),
             error_list: Vec::new(),
@@ -846,6 +915,8 @@ fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
 #[serde(default)]
 pub struct TonePatternEvent {
     pub short_name: String,
+    /// [`SystemInfo::id`].
+    pub system_id: u32,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub site: String,
     /// The call it's on (its `call_num`).
@@ -869,12 +940,16 @@ pub struct TonePatternEvent {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UnitEvent {
-    /// [`SystemInfo::index`]: for this run only; `short_name` is the system's identity.
+    /// [`SystemInfo::index`]: for this run only.
     pub system: u16,
+    /// [`SystemInfo::id`]: the system's identity.
+    pub system_id: u32,
     pub short_name: String,
-    /// The site whose control channel told it (its name).
+    /// The site whose control channel told it (its name), and its [`SiteInfo::id`].
     #[serde(skip_serializing_if = "String::is_empty")]
     pub site: String,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub site_id: u32,
     /// "registration" | "deregistration" | "affiliation" | "acknowledge" |
     /// "location" | "data_grant" | "answer_request" | "call_alert" |
     /// "emergency_alarm"
@@ -902,8 +977,10 @@ pub struct UnitEvent {
 #[serde(default)]
 pub struct AudioChunk {
     pub call_id: u32,
-    /// [`SystemInfo::index`]: for this run only; `short_name` is the system's identity.
+    /// [`SystemInfo::index`]: for this run only.
     pub system: u16,
+    /// [`SystemInfo::id`]: the system's identity.
+    pub system_id: u32,
     pub short_name: String,
     pub talkgroup: u32,
     pub sample_rate: u32,
@@ -929,8 +1006,10 @@ impl AudioChunk {
 #[serde(default)]
 pub struct VoiceChunk {
     pub call_id: u32,
-    /// [`SystemInfo::index`]: for this run only; `short_name` is the system's identity.
+    /// [`SystemInfo::index`]: for this run only.
     pub system: u16,
+    /// [`SystemInfo::id`]: the system's identity.
+    pub system_id: u32,
     pub short_name: String,
     pub talkgroup: u32,
     /// Who is talking (0: not known yet), and their name, as a call's `sources` give it.
@@ -1148,11 +1227,13 @@ pub struct SiteIdentity {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SiteScope {
-    /// Its system's [`SystemInfo::index`] and `short_name`.
+    /// Its system's [`SystemInfo::index`], `id` and `short_name`.
     pub index: u16,
+    pub system_id: u32,
     pub short_name: String,
-    /// This site's name (a system of one site: its short name).
+    /// This site's name (a system of one site: its short name), and its [`SiteInfo::id`].
     pub site_name: String,
+    pub site_id: u32,
     /// Its series' key (`sys/<short name>`, or `sys/<short name>/site/<site>`): [`Totals::series`]
     /// has its control channel under `<key>/cc/…`, its copies of calls under `<key>/calls/…`
     /// and `<key>/voice/…`.
@@ -1588,6 +1669,18 @@ pub mod base64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin can be off for a system unless it takes every system's
+    /// figures; it offers no system its settings unless it names them.
+    #[test]
+    fn what_a_plugin_lets_systems_do() {
+        let takes = |t: &[&str]| Manifest { subscribe: t.iter().map(|x| x.to_string()).collect(), ..Default::default() };
+        assert!(takes(&[topic::CALL_CONCLUDED, topic::STATUS, topic::LOG]).per_system() && takes(&[]).per_system());
+        assert!(!takes(&[topic::CALL_START, topic::TOTALS]).per_system());
+        let m: Manifest = serde_json::from_str(r#"{"id":"x","system_overrides":["server"]}"#).unwrap();
+        assert_eq!(m.system_overrides, ["server"]);
+        assert!(!serde_json::to_string(&Manifest::default()).unwrap().contains("system_overrides"), "none: left out");
+    }
 
     /// A Trunk Recorder file (flags as booleans, a field this crate doesn't
     /// name) reads; written back, flags are 0/1 as the recorder's own files

@@ -5,17 +5,105 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+- **Hytera data-channel signalling diagnostics**: identifies the observed
+  beacon, setup, short-status and end profiles; extracts verified radio/slot
+  fields and an experimental busy hint. Raw fields remain available, and
+  these messages do not create voice grants or frequency mappings.
+
 - **Hytera packet GPS and radio registration**: reassembles CRC-checked
   unconfirmed rate-1/2 short data on each slot. The experimental compressed
   north/west GPS profile emits standalone unit positions; RRS requests and
   answers report radio IPs and renewal intervals. Undocumented vendor control
   words remain visible as raw status without creating voice grants. See
-  [DMR GPS](docs/guides/dmr-gps.md) for limits, sources, and capture validation.
+  [DMR GPS](docs/developer/protocols/dmr-gps.md) for limits, sources, and capture validation.
 
 - **DMR and Hytera embedded GPS positions**, including XPT, are kept on the
   talking radio in the call JSON (`lat`, `lon` in `srcList`) and emitted as
-  position events, as P25 positions are. See [DMR GPS](docs/guides/dmr-gps.md)
+  position events, as P25 positions are. See [DMR GPS](docs/developer/protocols/dmr-gps.md)
   for scope and protocol sources.
+
+## [0.4.1] — 2026-11-22
+
+- **The recordings folder is checked, and a failure to write says why.** At startup and whenever the folder changes in
+  Setup, the recorder writes a file of its own there and deletes it. After that, every call's files go through the same
+  path, so a folder that stops taking them partway through a run (a drive unplugged, a share gone, a disk full) is
+  caught by the next call. The log says why the first time, in plain words, with what to do: permission denied (who
+  owns the folder, and who the app runs as), blocked by macOS privacy, a read-only disk, a full disk, a file in the way,
+  or a drive that isn't mounted. After that it counts the files not saved, and the first call saved afterwards says the
+  folder works again. The dashboard's computer light turns red, Platform → Disks shows why and how many files weren't
+  saved, the event feed has it, and Setup → Recording shows **Writable** or **Can't write** under the folder (Onboarding
+  too). A folder that vanished isn't made again on the disk beneath it, so a drive that's gone doesn't quietly fill the
+  system disk. A call the RAM spool can't take goes to the recordings folder instead of being lost.
+- **The gain tuner tells close calls apart by SNR.** Where a control channel already decodes in full at every gain, the
+  tuner can't score one gain over another by decoding. It now picks the gain that lifts that control channel's SNR by more
+  than 2 dB (and clearly more than the measurement's spread), since that margin is what a fade takes. When a tuning finds
+  nothing better than the gain the radio has, the "Gain too low" warning goes away and the RF page says **Best as it is**.
+  Changing the radio in Setup brings the warning back. The warning now quotes the minute's average peak, which is what it
+  decides on.
+- **Setup → Access is its own tab.** Signing in guards the whole recorder (dashboard, API, call audio, every interface
+  port), so it no longer sits under Recording.
+- **Channel CSV: a frequency under 10 000 is MHz** (#195), with or without a decimal point. Excel saves `147.000` as
+  `147`, which was read as 147 Hz.
+- **DMR: the rest channel is marked "rest" on Hytera XPT too.** The DMR panel marked it "rest" only on Capacity Plus;
+  XPT's free repeater read "control".
+- **The browser version no longer offers HackRF** as a kind of radio in Setup, since only the desktop app can open one.
+- **Docs reorganised and checked against the code.** Getting started and the guides explain how and why. The reference
+  lists every key, flag and message, and the developer pages cover the internals. Each topic has one page, and the
+  others link to it. Screenshots in the docs are taken from the app itself, in light and dark, and retaken at each
+  release.
+- For developers: `client.js` keeps `phase.restartNeeded`, and clears `status` and `sources` when a run starts.
+  `protocol.ts` defines `GET /api/session`'s answer (`ownPasskeys` included). `tool snr` accepts `--kinds` and
+  `--transmissions`. `tool corpus fetch` lays out each capture's folder as well as downloading it.
+
+## [0.4.0] — 2026-11-21
+
+- **Sign-in, optional** (#174). Off by default; off, nothing changes. Users in `server.auth.users`, each **View**
+  (`listen`) or **Admin** (`control`), signing in with an access token (shown once; the config keeps its SHA-256), a
+  passkey, or a proxy that vouches for them (Authelia, Authentik, oauth2-proxy, `tailscale serve` by header; Cloudflare
+  Access by its signed token). A request gets the lower of its port's access and its user's role, so one sign-in covers
+  the dashboard and every interface. **HTTPS** (`server.tls`, PEM certificate and key) covers every port, with renewed
+  files picked up within a minute. View users see no Setup, Plugins or controls, and are sent only the config their pages
+  show: every config field is named as shown or withheld, so a new one isn't sent until it's decided. When each user
+  last signed out everywhere, and each passkey's count, are kept in `access-state.json` beside the config, not in it.
+  `trunk-pro access` manages users from the command line (and is the way back in after a lockout). See Server, Log and
+  Monitor → Access in the configuration docs.
+- **Gain alerts** say the verdict first, then what was measured, then the fix only to someone who can make it
+  (`Gain too high · 2.1% clipping — Tune gain`).
+- **Plugins: a system sets only what a plugin offers** (#191, SDK 0.13.0). A plugin names the settings a system may set
+  again for itself (`system_overrides`: an uploader's server, say); a system's card offers those and no others, and
+  none is the default. Settings a system saved that the plugin doesn't offer are ignored, and its card in Setup →
+  Plugins lists the systems with them, to **Remove**.
+- **Plugins on or off, system by system** (#191). **Systems** on a plugin's card in Setup → Plugins (`systemsOff`):
+  nothing about a system it's off for reaches it, and the recorder doesn't wait on it for that system's calls. For every
+  plugin that takes only what's one system's (all but `totals`), MQTT among them (TrunkRecorder/trunk-plugin-mqtt#10).
+- **Plugins: systems and sites by id; settings for each site** (#192, SDK 0.14.0). Sites get an id as systems do, and
+  plugins are told both (`system_id`, `site_id`, on events and in the call JSON, beside the names), the same through
+  renames. A system with several sites has a row for each on its card, with the settings the plugin lets a site set
+  again (an uploader's account for that site), and **Sites** turns a plugin off for one. A recorded call's `sites` lists
+  every site it was recorded on, the kept copy's first, so an uploader sends a call wherever a site that heard it goes.
+- **The plugins, released with these:** OpenMHz 0.1.10 and Broadcastify Calls 0.1.9 (a site's own account in its row;
+  Broadcastify also sends `tg`, which conventional nodes need), Rdio Scanner 0.1.8, simplestream 0.1.6.
+- **Inside** (#190): systems known by id through a run, one call path for trunked and conventional calls, one table of
+  what each kind of system is, one watched-site control channel for EDACS, DMR and NXDN.
+- **A rule's capture says what set it off.** `trp:trigger` holds the event's facts as the rule's condition saw them (a
+  call's system, site, talkgroup, frequency, slot, times, radios, recorder, and for a call not saved why — `silent` or
+  `short` — with its audio and voice frames, good and bad), and when it fired, seconds into the capture and Unix ms.
+  `trp:state` holds what a replay can't tell: recorders in use then, and each DMR / NXDN site's channel table and
+  carriers as learned so far. Conditions can name the new call facts too (`call.not_saved`, `frames`, `unit_ids`, …).
+- **Live and replayed figures compare like for like.** A capture's `trp:live` now says which part of it it counts
+  (`from_s`, `to_s`) and, with a look-back, covers all of it, not just what came after the rule fired. `replay` prints
+  each site's control channel blocks over that part ("As live counted"), `replay --summary FILE` writes them as JSON, and
+  `tool submission` reports them beside live's for each site (`sites`, `live_good` / `replay_good`, …).
+
+### Updating
+
+
+- **Plugins' per-system settings.** A system's overrides of a setting its plugin doesn't name are ignored: update the
+  plugins (above) with this release. OpenMHz's **Separate sites** and Broadcastify's **Sites of their own** are no
+  longer read: give those sites their accounts in their rows on the system's card.
+- **Held plugin items** (delayed calls) from before this release are dropped, and a multi-site call's copies share one
+  `call_num`.
+
 
 ## [0.3.9] — 2026-11-20
 

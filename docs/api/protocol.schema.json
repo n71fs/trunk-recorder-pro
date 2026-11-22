@@ -46,7 +46,150 @@
         "listen",
         "control"
       ],
-      "description": "What a page may do with the recorder's API. \"listen\": see what the recorder does and play its calls, change nothing (its config comes without plugin settings and key sources). \"control\": everything the built-in interface can."
+      "description": "What a page may do with the recorder's API. \"listen\": see what the recorder does and play its calls, change nothing (its config is only what its pages show: no plugin settings, key sources, users, addresses or folders). \"control\": everything the built-in interface can."
+    },
+    "AuthCloudflare": {
+      "type": "object",
+      "properties": {
+        "team": {
+          "type": "string"
+        },
+        "aud": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "team",
+        "aud"
+      ],
+      "additionalProperties": false,
+      "description": "Cloudflare Access's application: its tokens (`Cf-Access-Jwt-Assertion`) are checked against `team`'s keys (its name, or `https://<team>.cloudflareaccess.com`), for its Audience (AUD) tag `aud`. Either not so isn't saved."
+    },
+    "AuthPasskey": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "created": {
+          "type": "number"
+        },
+        "id": {
+          "type": "string"
+        },
+        "key": {}
+      },
+      "required": [
+        "name",
+        "created",
+        "id",
+        "key"
+      ],
+      "additionalProperties": false,
+      "description": "A passkey: its name (\"iPhone\"), when it was added (Unix s), its credential id (base64url) and `key`, WebAuthn's record of it (its public key and counter; the recorder's to read)."
+    },
+    "AuthProxy": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Empty with `cloudflare` set."
+        },
+        "header": {
+          "type": "string",
+          "description": "Default \"Remote-User\"."
+        },
+        "cloudflare": {
+          "$ref": "#/definitions/AuthCloudflare",
+          "description": "Cloudflare Access in front. Absent: none."
+        },
+        "users": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The proxy's names for users whose name here differs (\"luke@example.com\": \"luke\")."
+        },
+        "other": {
+          "$ref": "#/definitions/ApiAccess"
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": false,
+      "description": "A reverse proxy that signs people in (Authelia, oauth2-proxy, tailscale serve): the name in its `header` is believed from the addresses in `from` alone (IPs or CIDR blocks; one that's neither isn't saved), and only when no token or session says who. With `cloudflare` set, Cloudflare Access instead: the email in its signed token, checked, from any address (`from` and `header` unused). The name is the user `users` maps it to, else the user of that name, with their role; any other name gets `other` (absent: not signed in; \"control\" is refused)."
+    },
+    "AuthSetup": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "anonymous": {
+          "$ref": "#/definitions/ApiAccess"
+        },
+        "users": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/AuthUser"
+          },
+          "description": "Who may sign in, by name. Made with createToken (the token's secret is shown once); removed by taking them out."
+        },
+        "proxy": {
+          "$ref": "#/definitions/AuthProxy",
+          "description": "A reverse proxy in front that signs people in, and says who in a header. Absent: none."
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "additionalProperties": false,
+      "description": "Signing in. `enabled`: a request gets the lower of its port's access and its user's — signed in with their access token's secret as `Authorization: Bearer`, `?token=`, or the cookie POST /api/login (or a passkey's sign-in) sets, or by the `proxy` in front — and without one, `anonymous`'s (absent: it must sign in; GET /api/session says so). Enabled, it needs a user with control access and a token or a passkey (or a proxy set), and `anonymous` can't be \"control\"."
+    },
+    "AuthToken": {
+      "type": "object",
+      "properties": {
+        "hash": {
+          "type": "string"
+        },
+        "created": {
+          "type": "number",
+          "description": "When it was made, Unix s."
+        }
+      },
+      "required": [
+        "hash",
+        "created"
+      ],
+      "additionalProperties": false,
+      "description": "An access token: its secret's SHA-256 (hex). The secret itself is never kept."
+    },
+    "AuthUser": {
+      "type": "object",
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/ApiAccess"
+        },
+        "token": {
+          "$ref": "#/definitions/AuthToken"
+        },
+        "passkeys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AuthPasskey"
+          },
+          "description": "Their passkeys: added by them, signed in, from a browser (POST /api/passkey/register/…); removed or renamed by editing this."
+        }
+      },
+      "required": [
+        "access"
+      ],
+      "additionalProperties": false,
+      "description": "Someone (or a program) who may sign in: what they may do, and what they sign in with (neither: nothing yet)."
     },
     "CallEntry": {
       "type": "object",
@@ -89,6 +232,33 @@
         "site": {
           "type": "string",
           "description": "The site its copy was kept from (a system of one site: its short name)."
+        },
+        "system_id": {
+          "type": "number",
+          "description": "Its system's and its site's ids (the same across renames and runs)."
+        },
+        "site_id": {
+          "type": "number"
+        },
+        "sites": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "number"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Every site it was recorded on, `site` first."
         },
         "talkgroup": {
           "type": "number"
@@ -1397,6 +1567,10 @@
           "type": "number",
           "description": "The next system id the recorder gives: above every one given, so none is given twice."
         },
+        "nextSiteId": {
+          "type": "number",
+          "description": "The next site id the recorder gives, as `nextSystemId`."
+        },
         "recording": {
           "$ref": "#/definitions/Recording"
         },
@@ -1431,6 +1605,18 @@
             "trpApi": {
               "type": "string",
               "description": "Where the trunkrecorder.pro API is, for the survey's license lookup (absent: https://trunkrecorder.pro)."
+            },
+            "auth": {
+              "$ref": "#/definitions/AuthSetup",
+              "description": "Signing in, on every interface's port (absent: off). Not in a listen-only connection's config."
+            },
+            "tls": {
+              "$ref": "#/definitions/TlsSetup",
+              "description": "HTTPS on every interface's port (absent: plain HTTP). Read as the app starts; a renewed certificate is picked up without a restart."
+            },
+            "hostname": {
+              "type": "string",
+              "description": "The name this computer is reached by over HTTPS (its certificate's): the URLs the recorder logs and opens, and where passkeys work besides localhost (absent: none). With a port (\"radio.example.com:8443\"): the dashboard's, where a proxy in front serves it."
             }
           },
           "required": [
@@ -1905,7 +2091,7 @@
               "type": "null"
             }
           ],
-          "description": "Capacity Plus: the rest channel's logical slot number, and its frequency once known."
+          "description": "Capacity Plus and XPT: the rest channel's logical slot number, and its frequency once known."
         },
         "keyed": {
           "type": "boolean",
@@ -2111,6 +2297,51 @@
       },
       "description": "A system's FCC licenses by frequency (Hz on the 6.25 kHz raster, as a string). Optional, for reference; plugins are told them."
     },
+    "FolderRow": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "\"recordings\", \"spool\" (while it's on)."
+        },
+        "path": {
+          "type": "string"
+        },
+        "ok": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "null: not checked yet."
+        },
+        "why": {
+          "type": "string",
+          "description": "While it fails: why in a few words, what the system said, what to do, since (Unix s), and files not written since."
+        },
+        "detail": {
+          "type": "string"
+        },
+        "fix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "since": {
+          "type": "number"
+        },
+        "lost": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "ok"
+      ],
+      "additionalProperties": false,
+      "description": "A folder calls are written to, and whether it takes them: checked at startup and when it changes, then told by every write."
+    },
     "FoundRadio": {
       "type": "object",
       "properties": {
@@ -2276,6 +2507,14 @@
                 "$ref": "#/definitions/Capability"
               },
               "description": "What this recorder can do beyond recording: show only what works. The desktop app can do all of them; the browser build, none."
+            },
+            "access": {
+              "$ref": "#/definitions/ApiAccess",
+              "description": "What this connection may do: its port's access, and no more than its user's with signing in on."
+            },
+            "user": {
+              "type": "string",
+              "description": "The user it signed in as, by name."
             }
           },
           "required": [
@@ -2284,7 +2523,8 @@
             "platform",
             "api",
             "surveyBands",
-            "capabilities"
+            "capabilities",
+            "access"
           ],
           "additionalProperties": false
         },
@@ -3049,6 +3289,10 @@
             "applied": {
               "type": "boolean"
             },
+            "outdated": {
+              "type": "boolean",
+              "description": "The radio was changed in Setup since: what it found was about the gain it had then."
+            },
             "error": {
               "type": "string"
             },
@@ -3774,11 +4018,14 @@
                 "controlRegained",
                 "sourceDrops",
                 "sourceClipping",
+                "sourceQuiet",
                 "sourceRecovered",
                 "pluginHealth",
                 "linkDown",
                 "linkUp",
                 "diskLow",
+                "folderUnwritable",
+                "folderWritable",
                 "spoolLow",
                 "spoolFull",
                 "spoolRecovered",
@@ -3844,6 +4091,10 @@
             "pct": {
               "type": "number"
             },
+            "peakDb": {
+              "type": "number",
+              "description": "sourceQuiet: its peaks over the last minute, averaged, dBFS (gain too low)."
+            },
             "plugin": {
               "type": "string"
             },
@@ -3890,6 +4141,21 @@
             "byMs": {
               "type": "number",
               "description": "clockStep: how far the wall clock jumped, ms (positive: forward)."
+            },
+            "folder": {
+              "type": "string",
+              "description": "folderUnwritable, folderWritable: which folder (\"recordings\", \"spool\"); with `why`, `path`."
+            },
+            "detail": {
+              "type": "string",
+              "description": "folderUnwritable: what the system said, and what to do."
+            },
+            "fix": {
+              "type": "string"
+            },
+            "lost": {
+              "type": "number",
+              "description": "folderWritable: files not written meanwhile."
             },
             "type": {
               "type": "string",
@@ -4468,6 +4734,33 @@
           "properties": {
             "type": {
               "type": "string",
+              "const": "tokenCreated"
+            },
+            "id": {
+              "type": "number"
+            },
+            "name": {
+              "type": "string"
+            },
+            "secret": {
+              "type": "string"
+            },
+            "error": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
               "const": "quit"
             }
           },
@@ -4492,6 +4785,22 @@
         },
         "candidate": {
           "type": "number"
+        },
+        "snr": {
+          "type": "object",
+          "properties": {
+            "diff": {
+              "type": "number"
+            },
+            "se": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "diff",
+            "se"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [
@@ -4501,7 +4810,7 @@
         "candidate"
       ],
       "additionalProperties": false,
-      "description": "How a candidate gain compared with the one it would replace, over the rounds: `diff` (candidate less incumbent, 0–100 points) and its standard error `se`."
+      "description": "How a candidate gain compared with the one it would replace, over the rounds: `diff` (candidate less incumbent, 0–100 points) and its standard error `se`; `snr`, the same of the control channel's SNR (dB), the tie-break where decoding is already full."
     },
     "GainSetting": {
       "type": "array",
@@ -5615,6 +5924,12 @@
           },
           "description": "\"recordings\", \"data\", and \"spool\" (the RAM spool, with its `kind`, calls `overflowed` to the disk, times it was `removed` while running, and `missing`: gone and not made again)."
         },
+        "folders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FolderRow"
+          }
+        },
         "spotlight": {
           "anyOf": [
             {
@@ -6022,6 +6337,10 @@
           ],
           "description": "Null when it can't be asked (see `problem`)."
         },
+        "perSystem": {
+          "type": "boolean",
+          "description": "It can be turned off for a system: everything it takes is one system's (not `totals`)."
+        },
         "problem": {
           "type": [
             "string",
@@ -6037,6 +6356,7 @@
         "path",
         "custom",
         "manifest",
+        "perSystem",
         "problem",
         "runtime"
       ],
@@ -6164,6 +6484,20 @@
         },
         "system_config": {
           "$ref": "#/definitions/PluginSchema"
+        },
+        "system_overrides": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Those of its settings (`config`'s top-level keys) a system may set again for itself; none: every system has the plugin's."
+        },
+        "site_overrides": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Those of its settings for each system (`system_config`'s top-level keys) a site may set again for itself; none: a system's sites have its settings."
         },
         "homepage": {
           "type": "string"
@@ -6556,6 +6890,20 @@
         "shareDecrypted": {
           "type": "boolean",
           "description": "Give it calls decrypted with the recorder's keys (their audio and files). Off: none are."
+        },
+        "systemsOff": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "The systems (by `id`) it's turned off for: nothing about them is sent to it. Only for a plugin that can be (`PluginInfo.perSystem`)."
+        },
+        "sitesOff": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "description": "The sites (by `id`) it's turned off for: their unit events and status aren't sent, nor a recorded call only they heard."
         }
       },
       "required": [
@@ -7110,6 +7458,10 @@
     "Site": {
       "type": "object",
       "properties": {
+        "id": {
+          "type": "number",
+          "description": "Its number, the same across renames and runs, never another site's (any system's): what plugins know it by. Given by the recorder."
+        },
         "name": {
           "type": "string",
           "description": "Its name, unique in its system (absent: the system's short name). The talkgroup file's Preferred Site names it; calls and plugins say it."
@@ -9434,6 +9786,27 @@
       "additionalProperties": false,
       "description": "A talkgroup as heard (radioQuery talkgroups / tg)."
     },
+    "TlsSetup": {
+      "type": "object",
+      "properties": {
+        "cert": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "hsts": {
+          "type": "boolean",
+          "description": "Strict-Transport-Security, a year: browsers keep to HTTPS on every port of this host name (absent: off)."
+        }
+      },
+      "required": [
+        "cert",
+        "key"
+      ],
+      "additionalProperties": false,
+      "description": "HTTPS: PEM files on the recorder's computer, each absolute, `~/…` or relative to the config file's folder. `cert`: the certificate, its chain after it (Let's Encrypt's fullchain.pem); `key`: its private key. A config whose pair can't be read, or whose key isn't the certificate's, isn't saved."
+    },
     "TonePatternKind": {
       "type": "string",
       "enum": [
@@ -10716,6 +11089,31 @@
           "properties": {
             "type": {
               "type": "string",
+              "const": "createToken"
+            },
+            "id": {
+              "type": "number"
+            },
+            "name": {
+              "type": "string"
+            },
+            "access": {
+              "$ref": "#/definitions/ApiAccess"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "access"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
               "const": "quit"
             }
           },
@@ -10956,7 +11354,11 @@
         },
         "system": {
           "type": "number",
-          "description": "Its system's number this run; `short_name` is its identity."
+          "description": "Its system's number this run."
+        },
+        "system_id": {
+          "type": "number",
+          "description": "Its system's id: the same across renames and runs."
         },
         "short_name": {
           "type": "string"
@@ -10985,6 +11387,7 @@
       "required": [
         "call_id",
         "system",
+        "system_id",
         "short_name",
         "talkgroup",
         "unit",

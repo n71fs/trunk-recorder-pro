@@ -90,8 +90,12 @@ fn run_with(ctx: Arc<Ctx>, mut platform: Platform) {
         let mut p = platform.sample(&mut agg, detail);
         ctx.plugins.report(&mut agg);
         let capture = ctx.config.lock().unwrap().recording.capture_dir.clone();
+        // (Where the config has the folder now: checked when that's new, and its disk watched.)
+        ctx.folders.tick(Path::new(&capture));
+        platform.watch("recordings", Path::new(&capture));
+        p["folders"] = ctx.folders.report();
         if let Some(s) = ctx.spool.lock().unwrap().clone() {
-            spool.watch(&ctx, &s, Path::new(&capture), &mut agg, &mut p);
+            spool.watch(&ctx, &s, &mut agg, &mut p);
         }
         if spotlight_for.as_ref().is_none_or(|(d, at)| *d != capture || at.elapsed() >= SPOTLIGHT_EVERY) {
             spotlight_for = Some((capture.clone(), Instant::now()));
@@ -147,7 +151,7 @@ fn run_with(ctx: Arc<Ctx>, mut platform: Platform) {
                 Some(b) => json!({ "bytes": b, "of": how }),
                 None => json!({ "why": how }),
             };
-            p["store"] = json!({ "backend": ctx.db.backend(), "radioIndex": ctx.db.indexes_radios(), "talkgroupIndex": ctx.db.indexes_talkgroups(), "registry": ctx.shared.radio.lock().unwrap().fill(), "sizes": s, "written": written });
+            p["store"] = json!({ "backend": ctx.db.backend(), "radioIndex": ctx.db.indexes_radios(), "talkgroupIndex": ctx.db.indexes_talkgroups(), "registry": ctx.shared.names.lock().unwrap().lookups(|names| ctx.shared.radio.lock().unwrap().fill(names)), "sizes": s, "written": written });
         }
         for d in p["disks"].as_array().into_iter().flatten() {
             let (Some(name), Some(total), Some(free)) = (d["name"].as_str(), d["totalBytes"].as_f64(), d["freeBytes"].as_f64()) else { continue };
@@ -179,13 +183,14 @@ struct SpoolWatch {
 
 impl SpoolWatch {
     /// Its disk row (into the platform's `disks`) and figures; events as it fills and empties.
-    fn watch(&mut self, ctx: &Ctx, s: &crate::spool::Spool, capture: &Path, sink: &mut dyn Sink, p: &mut Value) {
+    fn watch(&mut self, ctx: &Ctx, s: &crate::spool::Spool, sink: &mut dyn Sink, p: &mut Value) {
         if self.swept.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
             self.swept = Some(Instant::now());
             // (A call held back from a plugin waits that much longer.)
-            let n = s.sweep(capture, crate::spool::STALE + ctx.plugins.longest_delay());
+            let to = &ctx.folders.recordings;
+            let n = s.sweep(to, crate::spool::STALE + ctx.plugins.longest_delay());
             if n > 0 {
-                log::warn!("{n} file(s) left in the RAM spool by calls no plugin finished: moved to {}", capture.display());
+                log::warn!("{n} file(s) left in the RAM spool by calls no plugin finished: moved to {}", to.path().display());
             }
         }
         // Gone (deleted, unmounted): made again, and said, with how to stop it.

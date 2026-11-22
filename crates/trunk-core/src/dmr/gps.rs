@@ -2,7 +2,7 @@
 //! ETSI TS 102 361-2 §7.1.1.3 / Table 7.3 and §§7.2.15–17 define
 //! signed 25-bit longitude and signed 24-bit latitude. Hytera FID 0x68
 //! uses the same layout (SDRTrunk LCOpcode / GPSInformation).
-//! See docs/guides/dmr-gps.md for sources and scope.
+//! See docs/developer/protocols/dmr-gps.md for sources and scope.
 
 use super::slot::{FID_HYTERA, FID_STANDARD, Lc};
 use crate::bits::field;

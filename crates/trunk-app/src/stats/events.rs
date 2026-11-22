@@ -56,6 +56,9 @@ pub enum MonitorEvent {
     /// A source's samples hit the rails (gain too high?).
     #[serde(rename_all = "camelCase")]
     SourceClipping { source: String, pct: f64 },
+    /// A source's samples stayed tiny for a minute (gain too low?): `peak_db`, their peaks' average, dBFS.
+    #[serde(rename_all = "camelCase")]
+    SourceQuiet { source: String, peak_db: f64 },
     #[serde(rename_all = "camelCase")]
     SourceRecovered { source: String },
     // ── the desktop host's own ──
@@ -67,6 +70,20 @@ pub enum MonitorEvent {
     LinkUp { target: String, down_s: f64 },
     #[serde(rename_all = "camelCase")]
     DiskLow { path: String, free_pct: f64 },
+    /// A folder calls are written to ("recordings", "spool") stopped taking
+    /// files: `why` in a few words, `detail` what the system said, `fix` what to do.
+    #[serde(rename_all = "camelCase")]
+    FolderUnwritable {
+        folder: String,
+        path: String,
+        why: String,
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fix: Option<String>,
+    },
+    /// And takes them again; `lost`: files not written meanwhile.
+    #[serde(rename_all = "camelCase")]
+    FolderWritable { folder: String, path: String, lost: u64 },
     /// The RAM spool is filling (uploads not keeping up); `critical`: nearly full.
     #[serde(rename_all = "camelCase")]
     SpoolLow { free_pct: f64, critical: bool },
@@ -101,16 +118,16 @@ impl MonitorEvent {
     /// "info" | "warn" | "bad" | "ok": how the feed colours it.
     pub fn level(&self) -> &'static str {
         match self {
-            MonitorEvent::ControlLost { .. } | MonitorEvent::LinkDown { .. } | MonitorEvent::DiskLow { .. } | MonitorEvent::SpoolFull { .. } => "bad",
+            MonitorEvent::ControlLost { .. } | MonitorEvent::LinkDown { .. } | MonitorEvent::DiskLow { .. } | MonitorEvent::SpoolFull { .. } | MonitorEvent::FolderUnwritable { .. } => "bad",
             MonitorEvent::SpoolLow { critical, .. } | MonitorEvent::ClockOff { bad: critical, .. } => if *critical { "bad" } else { "warn" },
             MonitorEvent::SpoolRemoved { remade, .. } => if *remade { "warn" } else { "bad" },
-            MonitorEvent::SourceDrops { .. } | MonitorEvent::SourceClipping { .. } | MonitorEvent::ClockStep { .. } => "warn",
+            MonitorEvent::SourceDrops { .. } | MonitorEvent::SourceClipping { .. } | MonitorEvent::SourceQuiet { .. } | MonitorEvent::ClockStep { .. } => "warn",
             MonitorEvent::PluginHealth { state, .. } => match state.as_str() {
                 "error" => "bad",
                 "warning" => "warn",
                 _ => "ok",
             },
-            MonitorEvent::ControlRegained { .. } | MonitorEvent::LinkUp { .. } | MonitorEvent::SourceRecovered { .. } | MonitorEvent::SpoolRecovered { .. } | MonitorEvent::ClockOk {} => "ok",
+            MonitorEvent::ControlRegained { .. } | MonitorEvent::LinkUp { .. } | MonitorEvent::SourceRecovered { .. } | MonitorEvent::SpoolRecovered { .. } | MonitorEvent::FolderWritable { .. } | MonitorEvent::ClockOk {} => "ok",
             _ => "info",
         }
     }

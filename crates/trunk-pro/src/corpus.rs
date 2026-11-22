@@ -5,7 +5,8 @@
 //!
 //! `tool corpus add <capture folder> --manifest FILE --id ID --protocol P [--tier wideband]`
 //! puts a capture in a local manifest, and its files in the cache.
-//! `tool corpus fetch [--only a,b] [--tier t]` downloads what the cache lacks.
+//! `tool corpus fetch [--only a,b] [--tier t]` downloads what the cache lacks, and lays each
+//! capture out under its own names in `<cache>/captures/<id>` (what `run` replays).
 //! `tool corpus run --out DIR [--only a,b] [--tier t] [--against V] [--bless next|V]`
 //! replays each capture into `DIR/<id>`, as `captures/regress.sh` lays its runs
 //! out, and compares each with its expected output; `--bless` keeps what it got
@@ -33,7 +34,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::iq_capture;
-use crate::toolkit::hex;
+use crate::toolkit::{hex, sha256_hex};
 use crate::{die, Args};
 
 const EXPECTED: &str = "corpus/expected";
@@ -282,6 +283,52 @@ impl Results {
     }
 }
 
+/// A site's control channel blocks decoded cleanly and lost, over some of a
+/// recording: what a replay summary says as "CC N good / M bad", and a
+/// capture's `trp:live` as messages_good / messages_bad.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SiteFrames {
+    pub system: String,
+    pub site: String,
+    pub good: u64,
+    pub bad: u64,
+}
+
+impl SiteFrames {
+    /// Each site's so far.
+    pub fn of(s: &trunk_core::trunk::Status) -> Vec<SiteFrames> {
+        s.sites.iter().map(|y| SiteFrames { system: y.short_name.clone(), site: y.site_name.clone(), good: y.good, bad: y.bad }).collect()
+    }
+
+    /// Each site's from `start` to `end` (both [`SiteFrames::of`] the same replay).
+    pub fn between(start: &[SiteFrames], end: &[SiteFrames]) -> Vec<SiteFrames> {
+        end.iter()
+            .map(|e| {
+                let s = start.iter().find(|s| s.system == e.system && s.site == e.site);
+                SiteFrames { good: e.good.saturating_sub(s.map_or(0, |s| s.good)), bad: e.bad.saturating_sub(s.map_or(0, |s| s.bad)), ..e.clone() }
+            })
+            .collect()
+    }
+}
+
+/// What `replay --summary FILE` writes: each site's control channel blocks,
+/// over all of it, and over the part a capture's live figures cover.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ReplaySummary {
+    pub air_s: f64,
+    pub sites: Vec<SiteFrames>,
+    #[serde(default)]
+    pub live_window: Option<WindowFrames>,
+}
+
+/// Each site's blocks from `from_s` to `to_s`, seconds into the replay.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WindowFrames {
+    pub from_s: f64,
+    pub to_s: f64,
+    pub sites: Vec<SiteFrames>,
+}
+
 const FRAMES_PER_HASH: usize = 20;
 const ENVELOPE_MS: usize = 100;
 /// Analog calls whose loudness over time matches worse than this have changed for the worse.
@@ -293,7 +340,7 @@ const SAME_LENGTH_MS: i64 = 500;
 const LOG_DIFFERENCES: usize = 15;
 
 pub(crate) fn short_hash(bytes: &[u8], hex_chars: usize) -> String {
-    hex(&Sha256::digest(bytes))[..hex_chars].to_string()
+    sha256_hex(bytes)[..hex_chars].to_string()
 }
 
 /// The messages among a replay's `--messages` lines: `  12.34s  [site] kind text`, by what they say, not when.
@@ -867,8 +914,8 @@ pub fn run(a: &Args) {
             let entries = chosen(&m, a.get("only"), a.get("tier")).unwrap_or_else(|e| die(&e));
             if what == "fetch" {
                 for e in &entries {
-                    ok(e.files.iter().try_for_each(|f| fetch(base, &cache, f).map(|_| ())));
-                    println!("{}: {} files, {} MB", e.id, e.files.len(), e.bytes / 1_000_000);
+                    let dir = lay_out(base, &cache, e).unwrap_or_else(|err| die(&err));
+                    println!("{}: {} files, {} MB, in {}", e.id, e.files.len(), e.bytes / 1_000_000, dir.display());
                 }
                 return;
             }
@@ -903,7 +950,7 @@ mod tests {
     }
 
     fn file(name: &str, bytes: &[u8]) -> FileRef {
-        FileRef { name: name.into(), sha256: hex(&Sha256::digest(bytes)), bytes: bytes.len() as u64 }
+        FileRef { name: name.into(), sha256: sha256_hex(bytes), bytes: bytes.len() as u64 }
     }
 
     /// Serves `body` at any URL, `n` times, honouring a `Range: bytes=N-`; says what ranges it was asked for.
@@ -1000,6 +1047,12 @@ mod tests {
         assert!(iq_capture::open(laid.to_str().unwrap()).is_ok() && !laid.join("notes.txt").exists());
         assert_eq!(fs::read(laid.join("source-0.sigmf-data")).unwrap(), [0u8; 16]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sites_frames_over_a_window_are_the_difference() {
+        let f = |site: &str, good, bad| SiteFrames { system: "s".into(), site: site.into(), good, bad };
+        assert_eq!(SiteFrames::between(&[f("a", 10, 1)], &[f("a", 445, 4), f("b", 3, 0)]), [f("a", 435, 3), f("b", 3, 0)], "a site not yet running counts from nothing");
     }
 
     #[test]

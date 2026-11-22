@@ -3,11 +3,11 @@
 // plugins and the computer in a line each, and what happened lately.
 
 import { formatMhz } from "../config.ts";
-import { can, pluginOn, radioQuery, statsSince, setView, start, usePolled, useApp, type AppState } from "../controller.ts";
+import { can, mayEdit, pluginOn, radioQuery, statsSince, setView, snapshot, start, usePolled, useApp, type AppState } from "../controller.ts";
 import { Card, Fig, Figs, HeatStrip, LiveSpark, Light, Meter, Sparkline, Stat, SystemTag, Trend } from "../charts.tsx";
 import { ago, bytes, compact, hmm, mhz, ms, num, pct } from "../fmt.ts";
 import type { FreqRow, MonitorEvent, RadioSummary } from "../protocol.ts";
-import { change, connections, connectionsSummary, goTo, rateOver, dashSystems, K, KIND_LABEL, pluginHealth, platformHealth, scoped, spoolRemovedFix, recentAvg, running, systemOverallHealth, total, useHistory, usualOf, useUsual, val, type DashSystem, type Usual } from "./data.ts";
+import { FOLDER_LABEL, change, connections, connectionsSummary, gainFix, goTo, rateOver, dashSystems, K, KIND_LABEL, pluginHealth, platformHealth, scoped, spoolRemovedFix, recentAvg, running, systemOverallHealth, total, useHistory, usualOf, useUsual, val, type DashSystem, type Usual } from "./data.ts";
 import { SourceCard } from "./Rf.tsx";
 import { SiteRows } from "./Systems.tsx";
 import { BAD_MAX, badLevel, voiceBadPct } from "./Decode.tsx";
@@ -232,7 +232,9 @@ export function eventText(e: MonitorEvent): string {
     case "sourceDrops":
       return `${e.source}: dropping samples`;
     case "sourceClipping":
-      return `${e.source}: clipping ${e.pct}%`;
+      return `${e.source}: gain too high · ${e.pct}% clipping`;
+    case "sourceQuiet":
+      return `${e.source}: gain too low · peaks ${e.peakDb} dBFS`;
     case "sourceRecovered":
       return `${e.source}: clean again`;
     case "pluginHealth":
@@ -243,6 +245,10 @@ export function eventText(e: MonitorEvent): string {
       return `${e.target}: back · down ${e.downS ? `${Math.round(e.downS)} s` : "briefly"}`;
     case "diskLow":
       return `Disk ${e.path}: ${e.freePct}% free`;
+    case "folderUnwritable":
+      return `Can't write to ${FOLDER_LABEL[e.folder ?? ""] ?? e.folder}: ${e.why}`;
+    case "folderWritable":
+      return `Can write to ${FOLDER_LABEL[e.folder ?? ""] ?? e.folder} again${e.lost ? ` · ${e.lost} files not saved` : ""}`;
     case "spoolLow":
       return `RAM spool ${e.freePct}% free — ${e.critical ? "calls soon go to disk" : "uploads behind"}`;
     case "spoolFull":
@@ -267,10 +273,16 @@ function eventTip(e: MonitorEvent): string | undefined {
   switch (e.kind) {
     case "spoolRemoved":
       return spoolRemovedFix(e.spool);
+    case "folderUnwritable":
+      return [e.detail, e.fix].filter(Boolean).join(". ");
+    case "folderWritable":
+      return e.path;
     case "clockStep":
       return (e.byMs ?? 0) > 0 ? "Its time service set it, or the computer slept" : undefined;
     case "sourceClipping":
-      return "Samples at full scale";
+      return `Samples at full scale${gainFix(snapshot(), "high", " on its RF card")}`;
+    case "sourceQuiet":
+      return `Samples a few ADC steps tall for a minute${gainFix(snapshot(), "low", " on its RF card")}`;
     default:
       return undefined;
   }
@@ -289,6 +301,7 @@ function eventPlace(e: MonitorEvent): () => void {
       return () => setView("decode", e.system ?? "");
     case "sourceDrops":
     case "sourceClipping":
+    case "sourceQuiet":
     case "sourceRecovered":
       return () => setView("rf");
     case "pluginHealth":
@@ -416,14 +429,16 @@ export function Overview() {
               {s.config && systems.length ? `${systems.length} system${systems.length > 1 ? "s" : ""} set up` : "Set up a source and a system, then Start"}
             </p>
           </div>
-          <div className="row">
-            <button className="btn primary" onClick={start} disabled={!s.connected}>
-              Start
-            </button>
-            <button className="btn ghost" onClick={() => setView("setup")}>
-              Setup
-            </button>
-          </div>
+          {mayEdit() && (
+            <div className="row">
+              <button className="btn primary" onClick={start} disabled={!s.connected}>
+                Start
+              </button>
+              <button className="btn ghost" onClick={() => setView("setup")}>
+                Setup
+              </button>
+            </div>
+          )}
         </section>
       )}
       <div className="overview-grid">
@@ -447,7 +462,7 @@ export function Overview() {
           )}
           <h2 className="section-title">Status</h2>
           {can("host") && <PlatformLine s={s} />}
-          {can("plugins") && <PluginsLine s={s} />}
+          {can("plugins") && mayEdit() && <PluginsLine s={s} />}
           <EventFeed events={s.events} />
         </div>
       </div>

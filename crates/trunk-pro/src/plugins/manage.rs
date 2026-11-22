@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 use serde_json::{json, Value};
 use trunk_core::metrics::{key_part, Sink};
-use trunk_recorder_plugin::{Level, Manifest, Metrics, Outcome, State, SystemInfo};
+use trunk_recorder_plugin::{Level, Manifest, Metrics, Outcome, State};
 
 use super::delay::Delays;
 use super::hold::Hold;
@@ -203,7 +203,7 @@ fn alone(mut h: Arc<PluginHost>) -> PluginHost {
 
 /// What a recording's plugins start with: the systems, the capture folder,
 /// what answers their `calls.query` and what saves their `settings.save`.
-type StartEnv = (Vec<SystemInfo>, PathBuf, super::Calls, super::Saves);
+type StartEnv = (Vec<super::RunSystem>, PathBuf, super::Calls, super::Saves);
 
 /// The plugins' part of the app's shared state.
 pub struct Plugins {
@@ -302,6 +302,8 @@ impl Plugins {
                     Ok(m) => (Some(m), None),
                     Err(p) => (None, Some(p)),
                 };
+                // It can be off for a system ([`trunk_recorder_plugin::Manifest::per_system`]).
+                let per_system = manifest.as_ref().is_some_and(Manifest::per_system);
                 json!({
                     "id": id,
                     "path": exe,
@@ -310,6 +312,7 @@ impl Plugins {
                     // Installed from this GitHub repository, not the registry.
                     "unlistedFrom": if e.path.is_empty() { store::unlisted_from(id) } else { None },
                     "manifest": manifest,
+                    "perSystem": per_system,
                     "problem": problem,
                     "runtime": runtime.get(id).cloned().unwrap_or_default(),
                 })

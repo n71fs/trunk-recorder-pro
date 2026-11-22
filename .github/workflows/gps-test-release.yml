@@ -42,6 +42,9 @@ jobs:
           for check in test web perf; do
             jq -e --arg name "$check" '.jobs | any(.name == $name and .conclusion == "success")' jobs.json
           done
+          if jq -e '.jobs | any(.name == "shots")' jobs.json > /dev/null; then
+            jq -e '.jobs | any(.name == "shots" and .conclusion == "success")' jobs.json
+          fi
       - name: Download completed packages and upload with checksums
         shell: bash
         run: |
