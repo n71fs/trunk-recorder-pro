@@ -5,6 +5,18 @@ under `## [<version>]` when the tag `v<version>` is pushed).
 
 ## [Unreleased]
 
+## [0.4.1-gps.1] — 2026-11-22
+
+- Test prerelease based on upstream v0.4.1, including its recording, access,
+  server and dashboard updates, plus the DMR/Hytera GPS and data diagnostics below.
+- Revalidated against all nine supplied recordings: 12 CRC-checked packets and
+  nine GPS positions. Core tests and the CLI build check pass on the new base.
+- A user live test confirmed expected radio IDs and correct coordinate hemisphere.
+  Compressed GPS flags outside the observed north/west profile remain unsupported.
+- Call JSON uses upstream's existing `srcList` latitude/longitude fields; this
+  change adds DMR/Hytera positions to that path. Standalone packets produce
+  position events and update matching active calls, without creating call files.
+
 - **Hytera data-channel signalling diagnostics**: identifies the observed
   beacon, setup, short-status and end profiles; extracts verified radio/slot
   fields and an experimental busy hint. Raw fields remain available, and
